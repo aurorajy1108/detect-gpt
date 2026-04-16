@@ -14,6 +14,7 @@ import os
 import json
 import functools
 import custom_datasets
+import model_backends
 from multiprocessing.pool import ThreadPool
 import time
 
@@ -35,7 +36,7 @@ def load_base_model():
         mask_model.cpu()
     except NameError:
         pass
-    if args.openai_model is None:
+    if args.openai_model is None and args.tinker_model is None and base_model is not None:
         base_model.to(DEVICE)
     print(f'DONE ({time.time() - start:.2f}s)')
 
@@ -44,7 +45,7 @@ def load_mask_model():
     print('MOVING MASK MODEL TO GPU...', end='', flush=True)
     start = time.time()
 
-    if args.openai_model is None:
+    if args.openai_model is None and args.tinker_model is None and base_model is not None:
         base_model.cpu()
     if not args.random_fills:
         mask_model.to(DEVICE)
@@ -204,44 +205,75 @@ def _openai_sample(p):
     return p + r['choices'][0].text
 
 
+def _tinker_sample(prompt):
+    return tinker_backend.sample(
+        prompt,
+        max_tokens=200,
+        temperature=1.0,
+        top_p=args.top_p if args.do_top_p else None,
+        top_k=args.top_k if args.do_top_k else None,
+        num_samples=1,
+    )[0]
+
+
 # sample from base_model using ****only**** the first 30 tokens in each example as context
-def sample_from_model(texts, min_words=55, prompt_tokens=30):
+def sample_from_model(texts, min_words=55, prompt_tokens=30, prompt_texts=None, max_tries=10):
+    prompt_texts = prompt_texts or texts
+
     # encode each text as a list of token ids
-    if args.dataset == 'pubmed':
-        texts = [t[:t.index(custom_datasets.SEPARATOR)] for t in texts]
-        all_encoded = base_tokenizer(texts, return_tensors="pt", padding=True).to(DEVICE)
-    else:
-        all_encoded = base_tokenizer(texts, return_tensors="pt", padding=True).to(DEVICE)
-        all_encoded = {key: value[:, :prompt_tokens] for key, value in all_encoded.items()}
-
-    if args.openai_model:
-        # decode the prefixes back into text
-        prefixes = base_tokenizer.batch_decode(all_encoded['input_ids'], skip_special_tokens=True)
-        pool = ThreadPool(args.batch_size)
-
-        decoded = pool.map(_openai_sample, prefixes)
-    else:
-        decoded = ['' for _ in range(len(texts))]
-
-        # sample from the model until we get a sample with at least min_words words for each example
-        # this is an inefficient way to do this (since we regenerate for all inputs if just one is too short), but it works
+    if args.tinker_model:
+        decoded = ['' for _ in range(len(prompt_texts))]
         tries = 0
         while (m := min(len(x.split()) for x in decoded)) < min_words:
+            if tries >= max_tries:
+                print()
+                print(f"WARNING: hit max sample tries ({max_tries}); continuing with min words {m} < requested {min_words}")
+                break
             if tries != 0:
                 print()
                 print(f"min words: {m}, needed {min_words}, regenerating (try {tries})")
-
-            sampling_kwargs = {}
-            if args.do_top_p:
-                sampling_kwargs['top_p'] = args.top_p
-            elif args.do_top_k:
-                sampling_kwargs['top_k'] = args.top_k
-            min_length = 50 if args.dataset in ['pubmed'] else 150
-            outputs = base_model.generate(**all_encoded, min_length=min_length, max_length=200, do_sample=True, **sampling_kwargs, pad_token_id=base_tokenizer.eos_token_id, eos_token_id=base_tokenizer.eos_token_id)
-            decoded = base_tokenizer.batch_decode(outputs, skip_special_tokens=True)
+            decoded = [_tinker_sample(prompt) for prompt in prompt_texts]
             tries += 1
+    else:
+        if args.dataset == 'pubmed' and prompt_texts == texts:
+            texts = [t[:t.index(custom_datasets.SEPARATOR)] for t in texts]
+            all_encoded = base_tokenizer(texts, return_tensors="pt", padding=True).to(DEVICE)
+        else:
+            all_encoded = base_tokenizer(prompt_texts, return_tensors="pt", padding=True).to(DEVICE)
+            all_encoded = {key: value[:, :prompt_tokens] for key, value in all_encoded.items()}
 
-    if args.openai_model:
+        if args.openai_model:
+            # decode the prefixes back into text
+            prefixes = base_tokenizer.batch_decode(all_encoded['input_ids'], skip_special_tokens=True)
+            pool = ThreadPool(args.batch_size)
+
+            decoded = pool.map(_openai_sample, prefixes)
+        else:
+            decoded = ['' for _ in range(len(texts))]
+
+            # sample from the model until we get a sample with at least min_words words for each example
+            # this is an inefficient way to do this (since we regenerate for all inputs if just one is too short), but it works
+            tries = 0
+            while (m := min(len(x.split()) for x in decoded)) < min_words:
+                if tries >= max_tries:
+                    print()
+                    print(f"WARNING: hit max sample tries ({max_tries}); continuing with min words {m} < requested {min_words}")
+                    break
+                if tries != 0:
+                    print()
+                    print(f"min words: {m}, needed {min_words}, regenerating (try {tries})")
+
+                sampling_kwargs = {}
+                if args.do_top_p:
+                    sampling_kwargs['top_p'] = args.top_p
+                elif args.do_top_k:
+                    sampling_kwargs['top_k'] = args.top_k
+                min_length = 50 if args.dataset in ['pubmed'] else 150
+                outputs = base_model.generate(**all_encoded, min_length=min_length, max_length=200, do_sample=True, **sampling_kwargs, pad_token_id=base_tokenizer.eos_token_id, eos_token_id=base_tokenizer.eos_token_id)
+                decoded = base_tokenizer.batch_decode(outputs, skip_special_tokens=True)
+                tries += 1
+
+    if args.openai_model or args.tinker_model:
         global API_TOKEN_COUNTER
 
         # count total number of tokens with GPT2_TOKENIZER
@@ -264,6 +296,8 @@ def get_likelihood(logits, labels):
 
 # Get the log likelihood of each text under the base_model
 def get_ll(text):
+    if args.tinker_model:
+        return tinker_backend.get_mean_logprob(text)
     if args.openai_model:        
         kwargs = { "engine": args.openai_model, "temperature": 0, "max_tokens": 0, "echo": True, "logprobs": 0}
         r = openai.Completion.create(prompt=f"<|endoftext|>{text}", **kwargs)
@@ -281,7 +315,7 @@ def get_ll(text):
 
 
 def get_lls(texts):
-    if not args.openai_model:
+    if not args.openai_model and not args.tinker_model:
         return [get_ll(text) for text in texts]
     else:
         global API_TOKEN_COUNTER
@@ -296,7 +330,7 @@ def get_lls(texts):
 
 # get the average rank of each observed token sorted by model likelihood
 def get_rank(text, log=False):
-    assert args.openai_model is None, "get_rank not implemented for OpenAI models"
+    assert args.openai_model is None and args.tinker_model is None, "get_rank only implemented for local HuggingFace models"
 
     with torch.no_grad():
         tokenized = base_tokenizer(text, return_tensors="pt").to(DEVICE)
@@ -322,7 +356,7 @@ def get_rank(text, log=False):
 
 # get average entropy of each token in the text
 def get_entropy(text):
-    assert args.openai_model is None, "get_entropy not implemented for OpenAI models"
+    assert args.openai_model is None and args.tinker_model is None, "get_entropy only implemented for local HuggingFace models"
 
     with torch.no_grad():
         tokenized = base_tokenizer(text, return_tensors="pt").to(DEVICE)
@@ -594,10 +628,34 @@ def generate_samples(raw_data, batch_size):
         "sampled": [],
     }
 
-    for batch in range(len(raw_data) // batch_size):
-        print('Generating samples for batch', batch, 'of', len(raw_data) // batch_size)
-        original_text = raw_data[batch * batch_size:(batch + 1) * batch_size]
-        sampled_text = sample_from_model(original_text, min_words=30 if args.dataset in ['pubmed'] else 55)
+    num_batches = max(1, (len(raw_data) + batch_size - 1) // batch_size)
+    for batch in range(num_batches):
+        print('Generating samples for batch', batch, 'of', num_batches)
+        batch_records = raw_data[batch * batch_size:(batch + 1) * batch_size]
+        if not batch_records:
+            continue
+        target_min_words = args.min_sample_words
+        if args.dataset in ['pubmed']:
+            target_min_words = 30
+        if isinstance(batch_records[0], dict):
+            original_text = [record["original"] for record in batch_records]
+            prompt_text = [record.get("prompt") or record["original"] for record in batch_records]
+            if args.use_dataset_samples:
+                sampled_text = [record.get("sampled") or "" for record in batch_records]
+            else:
+                sampled_text = sample_from_model(
+                    original_text,
+                    min_words=target_min_words,
+                    prompt_texts=prompt_text,
+                    max_tries=args.max_sample_tries,
+                )
+        else:
+            original_text = batch_records
+            sampled_text = sample_from_model(
+                original_text,
+                min_words=target_min_words,
+                max_tries=args.max_sample_tries,
+            )
 
         for o, s in zip(original_text, sampled_text):
             if args.dataset == 'pubmed':
@@ -622,27 +680,56 @@ def generate_samples(raw_data, batch_size):
 def generate_data(dataset, key):
     # load data
     if dataset in custom_datasets.DATASETS:
-        data = custom_datasets.load(dataset, cache_dir)
+        data = custom_datasets.load_records(dataset, cache_dir=cache_dir)
+    elif dataset in custom_datasets.PAIR_DATASETS:
+        data = custom_datasets.load_records(
+            dataset,
+            cache_dir=cache_dir,
+            split=args.dataset_split,
+            source=args.dataset_source,
+        )
     else:
-        data = datasets.load_dataset(dataset, split='train', cache_dir=cache_dir)[key]
+        data = datasets.load_dataset(dataset, split=args.dataset_split, cache_dir=cache_dir)[key]
 
     # get unique examples, strip whitespace, and remove newlines
     # then take just the long examples, shuffle, take the first 5,000 to tokenize to save time
     # then take just the examples that are <= 512 tokens (for the mask model)
     # then generate n_samples samples
 
-    # remove duplicates from the data
-    data = list(dict.fromkeys(data))  # deterministic, as opposed to set()
+    if data and isinstance(data[0], dict):
+        deduped = []
+        seen = set()
+        for record in data:
+            normalized = {}
+            for field in ['prompt', 'original', 'sampled', 'source']:
+                value = record.get(field)
+                if isinstance(value, str):
+                    value = strip_newlines(value.strip())
+                normalized[field] = value
+            if not normalized['original']:
+                continue
+            dedupe_key = tuple(normalized.get(field) for field in ['prompt', 'original', 'sampled', 'source'])
+            if dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+            deduped.append(normalized)
+        data = deduped
+    else:
+        # remove duplicates from the data
+        data = list(dict.fromkeys(data))  # deterministic, as opposed to set()
 
-    # strip whitespace around each example
-    data = [x.strip() for x in data]
+        # strip whitespace around each example
+        data = [x.strip() for x in data]
 
-    # remove newlines from each example
-    data = [strip_newlines(x) for x in data]
+        # remove newlines from each example
+        data = [strip_newlines(x) for x in data]
 
     # try to keep only examples with > 250 words
     if dataset in ['writing', 'squad', 'xsum']:
-        long_data = [x for x in data if len(x.split()) > 250]
+        if data and isinstance(data[0], dict):
+            long_data = [x for x in data if len(x['original'].split()) > 250]
+        else:
+            long_data = [x for x in data if len(x.split()) > 250]
         if len(long_data) > 0:
             data = long_data
 
@@ -653,17 +740,27 @@ def generate_data(dataset, key):
 
     # keep only examples with <= 512 tokens according to mask_tokenizer
     # this step has the extra effect of removing examples with low-quality/garbage content
-    tokenized_data = preproc_tokenizer(data)
-    data = [x for x, y in zip(data, tokenized_data["input_ids"]) if len(y) <= 512]
+    if data and isinstance(data[0], dict):
+        tokenized_data = preproc_tokenizer([record['original'] for record in data])
+        data = [x for x, y in zip(data, tokenized_data["input_ids"]) if len(y) <= 512]
+    else:
+        tokenized_data = preproc_tokenizer(data)
+        data = [x for x, y in zip(data, tokenized_data["input_ids"]) if len(y) <= 512]
 
     # print stats about remainining data
     print(f"Total number of samples: {len(data)}")
-    print(f"Average number of words: {np.mean([len(x.split()) for x in data])}")
+    if data and isinstance(data[0], dict):
+        print(f"Average number of words: {np.mean([len(x['original'].split()) for x in data])}")
+    else:
+        print(f"Average number of words: {np.mean([len(x.split()) for x in data])}")
 
     return generate_samples(data[:n_samples], batch_size=batch_size)
 
 
 def load_base_model_and_tokenizer(name):
+    if args.tinker_model is not None:
+        return None, tinker_backend.tokenizer
+
     if args.openai_model is None:
         print(f'Loading BASE model {args.base_model_name}...')
         base_model_kwargs = {}
@@ -743,11 +840,14 @@ def eval_supervised(data, model):
 
 
 if __name__ == '__main__':
-    DEVICE = "cuda"
+    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
     parser = argparse.ArgumentParser()
     parser.add_argument('--dataset', type=str, default="xsum")
     parser.add_argument('--dataset_key', type=str, default="document")
+    parser.add_argument('--dataset_split', type=str, default="train")
+    parser.add_argument('--dataset_source', type=str, default=None)
+    parser.add_argument('--use_dataset_samples', action='store_true')
     parser.add_argument('--pct_words_masked', type=float, default=0.3) # pct masked is actually pct_words_masked * (span_length / (span_length + 2 * buffer_size))
     parser.add_argument('--span_length', type=int, default=2)
     parser.add_argument('--n_samples', type=int, default=200)
@@ -769,6 +869,10 @@ if __name__ == '__main__':
     parser.add_argument('--output_name', type=str, default="")
     parser.add_argument('--openai_model', type=str, default=None)
     parser.add_argument('--openai_key', type=str)
+    parser.add_argument('--tinker_model', type=str, default=None)
+    parser.add_argument('--tinker_tokenizer_name', type=str, default=None)
+    parser.add_argument('--tinker_api_key', type=str, default=None)
+    parser.add_argument('--api_cache_dir', type=str, default="api_cache")
     parser.add_argument('--baselines_only', action='store_true')
     parser.add_argument('--skip_baselines', action='store_true')
     parser.add_argument('--buffer_size', type=int, default=1)
@@ -777,6 +881,8 @@ if __name__ == '__main__':
     parser.add_argument('--pre_perturb_span_length', type=int, default=5)
     parser.add_argument('--random_fills', action='store_true')
     parser.add_argument('--random_fills_tokens', action='store_true')
+    parser.add_argument('--min_sample_words', type=int, default=55)
+    parser.add_argument('--max_sample_tries', type=int, default=10)
     parser.add_argument('--cache_dir', type=str, default="~/.cache")
     args = parser.parse_args()
 
@@ -786,6 +892,8 @@ if __name__ == '__main__':
         import openai
         assert args.openai_key is not None, "Must provide OpenAI API key as --openai_key"
         openai.api_key = args.openai_key
+    if args.openai_model is not None and args.tinker_model is not None:
+        raise ValueError("Choose either --openai_model or --tinker_model, not both")
 
     START_DATE = datetime.datetime.now().strftime('%Y-%m-%d')
     START_TIME = datetime.datetime.now().strftime('%H-%M-%S-%f')
@@ -795,7 +903,9 @@ if __name__ == '__main__':
     precision_string = "int8" if args.int8 else ("fp16" if args.half else "fp32")
     sampling_string = "top_k" if args.do_top_k else ("top_p" if args.do_top_p else "temp")
     output_subfolder = f"{args.output_name}/" if args.output_name else ""
-    if args.openai_model is None:
+    if args.tinker_model is not None:
+        base_model_name = "tinker-" + args.tinker_model.replace('/', '_')
+    elif args.openai_model is None:
         base_model_name = args.base_model_name.replace('/', '_')
     else:
         base_model_name = "openai-" + args.openai_model.replace('/', '_')
@@ -807,7 +917,11 @@ if __name__ == '__main__':
 
     # write args to file
     with open(os.path.join(SAVE_FOLDER, "args.json"), "w") as f:
-        json.dump(args.__dict__, f, indent=4)
+        safe_args = dict(args.__dict__)
+        for secret_key in ['openai_key', 'tinker_api_key']:
+            if safe_args.get(secret_key):
+                safe_args[secret_key] = "***REDACTED***"
+        json.dump(safe_args, f, indent=4)
 
     mask_filling_model_name = args.mask_filling_model_name
     n_samples = args.n_samples
@@ -816,13 +930,26 @@ if __name__ == '__main__':
     n_perturbation_rounds = args.n_perturbation_rounds
     n_similarity_samples = args.n_similarity_samples
 
-    cache_dir = args.cache_dir
+    cache_dir = os.path.expanduser(args.cache_dir)
+    args.api_cache_dir = os.path.expanduser(args.api_cache_dir)
     os.environ["XDG_CACHE_HOME"] = cache_dir
     if not os.path.exists(cache_dir):
         os.makedirs(cache_dir)
     print(f"Using cache dir {cache_dir}")
+    print(f"Using API cache dir {args.api_cache_dir}")
 
     GPT2_TOKENIZER = transformers.GPT2Tokenizer.from_pretrained('gpt2', cache_dir=cache_dir)
+
+    tinker_backend = None
+    if args.tinker_model is not None:
+        print(f'Loading Tinker sampling backend {args.tinker_model}...')
+        tinker_backend = model_backends.TinkerSamplingBackend(
+            args.tinker_model,
+            cache_dir=cache_dir,
+            tokenizer_name=args.tinker_tokenizer_name,
+            api_key=args.tinker_api_key,
+            cache_root=args.api_cache_dir,
+        )
 
     # generic generative model
     base_model, base_tokenizer = load_base_model_and_tokenizer(args.base_model_name)
@@ -859,7 +986,7 @@ if __name__ == '__main__':
                 FILL_DICTIONARY.update(text.split())
         FILL_DICTIONARY = sorted(list(FILL_DICTIONARY))
 
-    if args.scoring_model_name:
+    if args.scoring_model_name and args.tinker_model is None:
         print(f'Loading SCORING model {args.scoring_model_name}...')
         del base_model
         del base_tokenizer
@@ -874,7 +1001,7 @@ if __name__ == '__main__':
 
     if not args.skip_baselines:
         baseline_outputs = [run_baseline_threshold_experiment(get_ll, "likelihood", n_samples=n_samples)]
-        if args.openai_model is None:
+        if args.openai_model is None and args.tinker_model is None:
             rank_criterion = lambda text: -get_rank(text, log=False)
             baseline_outputs.append(run_baseline_threshold_experiment(rank_criterion, "rank", n_samples=n_samples))
             logrank_criterion = lambda text: -get_rank(text, log=True)
@@ -903,7 +1030,7 @@ if __name__ == '__main__':
         with open(os.path.join(SAVE_FOLDER, f"likelihood_threshold_results.json"), "w") as f:
             json.dump(baseline_outputs[0], f)
 
-        if args.openai_model is None:
+        if args.openai_model is None and args.tinker_model is None:
             # write rank threshold results to a file
             with open(os.path.join(SAVE_FOLDER, f"rank_threshold_results.json"), "w") as f:
                 json.dump(baseline_outputs[1], f)

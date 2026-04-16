@@ -1,10 +1,13 @@
 import random
+import json
 import datasets
+from huggingface_hub import hf_hub_download
 
 SEPARATOR = '<<<SEP>>>'
 
 
 DATASETS = ['writing', 'english', 'german', 'pubmed']
+PAIR_DATASETS = ['hc3', 'hc3_zh']
 
 
 def load_pubmed(cache_dir):
@@ -79,6 +82,84 @@ def load_german(cache_dir):
 
 def load_english(cache_dir):
     return load_language('en', cache_dir)
+
+
+def _first_nonempty(value):
+    if isinstance(value, str):
+        text = value.strip()
+        return text or None
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            text = _first_nonempty(item)
+            if text:
+                return text
+    return None
+
+
+def _infer_prompt(example):
+    for key in ['question', 'prompt', 'instruction', 'input', 'query']:
+        if key in example:
+            text = _first_nonempty(example[key])
+            if text:
+                return text
+    return None
+
+
+def _infer_human_answer(example):
+    for key in ['human_answers', 'human_answer', 'human', 'reference', 'references', 'answer_human']:
+        if key in example:
+            text = _first_nonempty(example[key])
+            if text:
+                return text
+    return None
+
+
+def _infer_model_answer(example):
+    for key in ['chatgpt_answers', 'chatgpt_answer', 'chatgpt', 'model_answers', 'ai_answers', 'answer_chatgpt']:
+        if key in example:
+            text = _first_nonempty(example[key])
+            if text:
+                return text
+    return None
+
+
+def load_hc3_records(cache_dir, language='en', split='train', source=None):
+    repo_id = 'Hello-SimpleAI/HC3-Chinese' if language == 'zh' else 'Hello-SimpleAI/HC3'
+    filename = f"{source or 'all'}.jsonl"
+    file_path = hf_hub_download(
+        repo_id=repo_id,
+        repo_type='dataset',
+        filename=filename,
+        cache_dir=cache_dir,
+    )
+
+    records = []
+    with open(file_path, 'r', encoding='utf-8') as handle:
+        for line in handle:
+            example = json.loads(line)
+            original = _infer_human_answer(example)
+            sampled = _infer_model_answer(example)
+            prompt = _infer_prompt(example)
+            if not original:
+                continue
+            records.append({
+                'prompt': prompt,
+                'original': original,
+                'sampled': sampled,
+                'source': source or 'all',
+            })
+
+    return records
+
+
+def load_records(name, cache_dir, **kwargs):
+    if name in DATASETS:
+        return [{'original': text} for text in load(name, cache_dir=cache_dir, **kwargs)]
+    if name == 'hc3':
+        return load_hc3_records(cache_dir=cache_dir, language='en', **kwargs)
+    if name == 'hc3_zh':
+        return load_hc3_records(cache_dir=cache_dir, language='zh', **kwargs)
+    raise ValueError(f'Unknown dataset {name}')
 
 
 def load(name, cache_dir, **kwargs):

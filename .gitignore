@@ -1,0 +1,8 @@
+__pycache__/
+api_cache/
+tmp_results/
+batch_job_markers/
+batch_job_markers_qwen3_8b_formal/
+
+# Keep completed lightweight experiment outputs if desired, but exclude the ongoing formal run artifacts.
+results/formal_qwen3_8b/
