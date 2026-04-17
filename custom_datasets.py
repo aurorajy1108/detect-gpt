@@ -1,5 +1,6 @@
-import random
 import json
+import random
+
 import datasets
 from huggingface_hub import hf_hub_download
 
@@ -8,6 +9,10 @@ SEPARATOR = '<<<SEP>>>'
 
 DATASETS = ['writing', 'english', 'german', 'pubmed']
 PAIR_DATASETS = ['hc3', 'hc3_zh']
+HC3_SOURCES = {
+    'en': ['finance', 'medicine', 'open_qa', 'reddit_eli5', 'wiki_csai'],
+    'zh': ['finance', 'medicine', 'open_qa', 'law', 'psychology', 'baike', 'nlpcc_dbqa'],
+}
 
 
 def load_pubmed(cache_dir):
@@ -123,31 +128,43 @@ def _infer_model_answer(example):
     return None
 
 
+def _normalize_sources(language, source=None):
+    if source is None:
+        return HC3_SOURCES[language]
+    if isinstance(source, str):
+        if source.lower() in {'all', '*'}:
+            return HC3_SOURCES[language]
+        return [part.strip() for part in source.split(',') if part.strip()]
+    return list(source)
+
+
 def load_hc3_records(cache_dir, language='en', split='train', source=None):
     repo_id = 'Hello-SimpleAI/HC3-Chinese' if language == 'zh' else 'Hello-SimpleAI/HC3'
-    filename = f"{source or 'all'}.jsonl"
-    file_path = hf_hub_download(
-        repo_id=repo_id,
-        repo_type='dataset',
-        filename=filename,
-        cache_dir=cache_dir,
-    )
-
     records = []
-    with open(file_path, 'r', encoding='utf-8') as handle:
-        for line in handle:
-            example = json.loads(line)
-            original = _infer_human_answer(example)
-            sampled = _infer_model_answer(example)
-            prompt = _infer_prompt(example)
-            if not original:
-                continue
-            records.append({
-                'prompt': prompt,
-                'original': original,
-                'sampled': sampled,
-                'source': source or 'all',
-            })
+
+    for current_source in _normalize_sources(language, source):
+        filename = f"{current_source}.jsonl"
+        file_path = hf_hub_download(
+            repo_id=repo_id,
+            repo_type='dataset',
+            filename=filename,
+            cache_dir=cache_dir,
+        )
+
+        with open(file_path, 'r', encoding='utf-8') as handle:
+            for line in handle:
+                example = json.loads(line)
+                original = _infer_human_answer(example)
+                sampled = _infer_model_answer(example)
+                prompt = _infer_prompt(example)
+                if not original:
+                    continue
+                records.append({
+                    'prompt': prompt,
+                    'original': original,
+                    'sampled': sampled,
+                    'source': current_source,
+                })
 
     return records
 

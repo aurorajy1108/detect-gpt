@@ -679,7 +679,11 @@ def generate_samples(raw_data, batch_size):
 
 def generate_data(dataset, key):
     # load data
-    if dataset in custom_datasets.DATASETS:
+    loaded_from_manifest = args.dataset_manifest is not None
+    if loaded_from_manifest:
+        with open(args.dataset_manifest, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    elif dataset in custom_datasets.DATASETS:
         data = custom_datasets.load_records(dataset, cache_dir=cache_dir)
     elif dataset in custom_datasets.PAIR_DATASETS:
         data = custom_datasets.load_records(
@@ -733,19 +737,20 @@ def generate_data(dataset, key):
         if len(long_data) > 0:
             data = long_data
 
-    random.seed(0)
-    random.shuffle(data)
+    if not loaded_from_manifest:
+        random.seed(0)
+        random.shuffle(data)
 
-    data = data[:5_000]
+        data = data[:5_000]
 
-    # keep only examples with <= 512 tokens according to mask_tokenizer
-    # this step has the extra effect of removing examples with low-quality/garbage content
-    if data and isinstance(data[0], dict):
-        tokenized_data = preproc_tokenizer([record['original'] for record in data])
-        data = [x for x, y in zip(data, tokenized_data["input_ids"]) if len(y) <= 512]
-    else:
-        tokenized_data = preproc_tokenizer(data)
-        data = [x for x, y in zip(data, tokenized_data["input_ids"]) if len(y) <= 512]
+        # keep only examples with <= 512 tokens according to mask_tokenizer
+        # this step has the extra effect of removing examples with low-quality/garbage content
+        if data and isinstance(data[0], dict):
+            tokenized_data = preproc_tokenizer([record['original'] for record in data])
+            data = [x for x, y in zip(data, tokenized_data["input_ids"]) if len(y) <= 512]
+        else:
+            tokenized_data = preproc_tokenizer(data)
+            data = [x for x, y in zip(data, tokenized_data["input_ids"]) if len(y) <= 512]
 
     # print stats about remainining data
     print(f"Total number of samples: {len(data)}")
@@ -847,6 +852,7 @@ if __name__ == '__main__':
     parser.add_argument('--dataset_key', type=str, default="document")
     parser.add_argument('--dataset_split', type=str, default="train")
     parser.add_argument('--dataset_source', type=str, default=None)
+    parser.add_argument('--dataset_manifest', type=str, default=None)
     parser.add_argument('--use_dataset_samples', action='store_true')
     parser.add_argument('--pct_words_masked', type=float, default=0.3) # pct masked is actually pct_words_masked * (span_length / (span_length + 2 * buffer_size))
     parser.add_argument('--span_length', type=int, default=2)

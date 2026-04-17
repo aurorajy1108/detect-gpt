@@ -98,13 +98,18 @@ def build_jobs(args):
                 continue
 
             model_name = pair[stage_name]
+            manifest_path = None
+            if dataset_cfg["language"] == "en":
+                manifest_path = args.dataset_manifest_en
+            elif dataset_cfg["language"] == "zh":
+                manifest_path = args.dataset_manifest_zh
             config = {
                 "family": pair["family"],
                 "stage": stage_name,
                 "model_name": model_name,
                 "dataset": dataset_cfg["dataset"],
                 "language": dataset_cfg["language"],
-                "source": dataset_cfg["source"],
+                "source": Path(manifest_path).stem if manifest_path else dataset_cfg["source"],
                 "mask_model": dataset_cfg["mask_model"],
                 "answer_mode": answer_mode,
                 "n_samples": args.n_samples,
@@ -114,6 +119,7 @@ def build_jobs(args):
                 "n_perturbation_list": args.n_perturbation_list,
                 "n_perturbation_rounds": args.n_perturbation_rounds,
                 "top_p": args.top_p,
+                "dataset_manifest": manifest_path,
             }
             config["job_id"] = stable_job_id(config)
             jobs.append(config)
@@ -163,6 +169,9 @@ def build_command(job, args):
         "--max_sample_tries",
         str(args.max_sample_tries),
     ]
+    manifest_path = job.get("dataset_manifest")
+    if manifest_path:
+        command.extend(["--dataset_manifest", manifest_path])
     if job["answer_mode"] == "regenerated_answers" and args.regenerated_min_sample_words is not None:
         command.extend(["--min_sample_words", str(args.regenerated_min_sample_words)])
     if job["answer_mode"] == "dataset_answers":
@@ -185,6 +194,8 @@ def main():
     parser.add_argument("--n_perturbation_rounds", type=int, default=1)
     parser.add_argument("--top_p", type=float, default=0.96)
     parser.add_argument("--dataset_split", type=str, default="train")
+    parser.add_argument("--dataset_manifest_en", type=str, default=None)
+    parser.add_argument("--dataset_manifest_zh", type=str, default=None)
     parser.add_argument("--api_cache_dir", type=str, default="api_cache")
     parser.add_argument("--cache_dir", type=str, default="~/.cache")
     parser.add_argument("--min_sample_words", type=int, default=55)
