@@ -2,6 +2,7 @@ import asyncio
 import hashlib
 import json
 import os
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -32,10 +33,20 @@ class DiskCache:
     def set(self, payload, value):
         key = _stable_key(payload)
         path = self._path_for_key(key)
-        tmp_path = path.with_suffix(".tmp")
-        with open(tmp_path, "w", encoding="utf-8") as handle:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_name = tempfile.mkstemp(
+            suffix=".tmp",
+            dir=str(path.parent),
+            prefix=f"{path.stem}.",
+        )
+        tmp_path = Path(tmp_name)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
             json.dump(value, handle, ensure_ascii=False)
-        os.replace(tmp_path, path)
+        try:
+            os.replace(tmp_path, path)
+        finally:
+            if tmp_path.exists():
+                tmp_path.unlink()
 
 
 class TinkerSamplingBackend:

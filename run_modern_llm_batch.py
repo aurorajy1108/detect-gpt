@@ -151,9 +151,6 @@ def build_command(job, args):
         str(job["n_perturbation_rounds"]),
         "--mask_filling_model_name",
         job["mask_model"],
-        "--do_top_p",
-        "--top_p",
-        str(job["top_p"]),
         "--tinker_model",
         job["model_name"],
         "--base_model_name",
@@ -172,6 +169,8 @@ def build_command(job, args):
     manifest_path = job.get("dataset_manifest")
     if manifest_path:
         command.extend(["--dataset_manifest", manifest_path])
+    if args.do_top_p:
+        command.extend(["--do_top_p", "--top_p", str(job["top_p"])])
     if job["answer_mode"] == "regenerated_answers" and args.regenerated_min_sample_words is not None:
         command.extend(["--min_sample_words", str(args.regenerated_min_sample_words)])
     if job["answer_mode"] == "dataset_answers":
@@ -193,6 +192,7 @@ def main():
     parser.add_argument("--n_perturbation_list", type=str, default="5")
     parser.add_argument("--n_perturbation_rounds", type=int, default=1)
     parser.add_argument("--top_p", type=float, default=0.96)
+    parser.add_argument("--do_top_p", action="store_true")
     parser.add_argument("--dataset_split", type=str, default="train")
     parser.add_argument("--dataset_manifest_en", type=str, default=None)
     parser.add_argument("--dataset_manifest_zh", type=str, default=None)
