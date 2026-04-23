@@ -1,10 +1,11 @@
+import json
 import random
 import datasets
 
 SEPARATOR = '<<<SEP>>>'
 
 
-DATASETS = ['writing', 'english', 'german', 'pubmed']
+DATASETS = ['writing', 'english', 'german', 'pubmed', 'hc3']
 
 
 def load_pubmed(cache_dir):
@@ -79,6 +80,48 @@ def load_german(cache_dir):
 
 def load_english(cache_dir):
     return load_language('en', cache_dir)
+
+
+def load_hc3(cache_dir, **kwargs):
+    # Returns flat list of human texts (for compatibility with load() interface).
+    # Use load_hc3_paired() when you need the ChatGPT answers too.
+    pairs = load_hc3_paired(cache_dir, n_samples=None)
+    return pairs["original"]
+
+
+def load_hc3_paired(cache_dir, n_samples=None, min_words=55):
+    """
+    Load HC3 and return already-paired {"original": [...], "sampled": [...]}
+    where original = human answer, sampled = ChatGPT answer.
+    Skips pairs where either side is too short.
+    """
+    from huggingface_hub import hf_hub_download
+    path = hf_hub_download(
+        repo_id='Hello-SimpleAI/HC3',
+        filename='all.jsonl',
+        repo_type='dataset',
+        cache_dir=cache_dir,
+    )
+    original, sampled = [], []
+    with open(path) as f:
+        for line in f:
+            ex = json.loads(line)
+            h = ex['human_answers'][0].strip().replace('\n', ' ') if ex['human_answers'] else None
+            c = ex['chatgpt_answers'][0].strip().replace('\n', ' ') if ex['chatgpt_answers'] else None
+            if not h or not c:
+                continue
+            if len(h.split()) < min_words or len(c.split()) < min_words:
+                continue
+            # trim each pair to same word count
+            shorter = min(len(h.split()), len(c.split()))
+            original.append(' '.join(h.split()[:shorter]))
+            sampled.append(' '.join(c.split()[:shorter]))
+
+    if n_samples is not None:
+        original = original[:n_samples]
+        sampled  = sampled[:n_samples]
+
+    return {"original": original, "sampled": sampled}
 
 
 def load(name, cache_dir, **kwargs):

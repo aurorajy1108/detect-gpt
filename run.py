@@ -16,6 +16,7 @@ import functools
 import custom_datasets
 from multiprocessing.pool import ThreadPool
 import time
+from scipy import stats as scipy_stats
 
 
 
@@ -514,6 +515,209 @@ def run_perturbation_experiment(results, criterion, span_length=10, n_perturbati
     }
 
 
+# ---------------------------------------------------------------------------
+# Adaptive-k DetectGPT
+# ---------------------------------------------------------------------------
+
+def _ci_stop(ll_x, perturbed_lls, n_min, n_max, alpha):
+    """Return True when we are confident enough to stop adding perturbations.
+
+    Stops when the (1-alpha) t-CI on the perturbation discrepancy d = log p(x)
+    - E[log p(x̃)] lies entirely above or below zero, meaning the text is
+    clearly model-generated (d > 0) or clearly human-written (d < 0).
+    """
+    n = len(perturbed_lls)
+    if n >= n_max:
+        return True
+    if n < n_min:
+        return False
+    mean_p = np.mean(perturbed_lls)
+    std_p = np.std(perturbed_lls, ddof=1)
+    if std_p == 0:
+        return True
+    discrepancy = ll_x - mean_p
+    t_crit = scipy_stats.t.ppf(1 - alpha / 2, df=n - 1)
+    half_width = t_crit * std_p / np.sqrt(n)
+    return (discrepancy - half_width > 0) or (discrepancy + half_width < 0)
+
+
+def get_perturbation_results_adaptive(
+    span_length=10,
+    n_perturbations_max=100,
+    n_perturbations_min=10,
+    batch_per_round=10,
+    confidence=0.95,
+    n_samples=500,
+):
+    """Round-based DetectGPT that stops early per-text using a confidence interval.
+
+    Each round generates `batch_per_round` new perturbations for every text
+    that has not yet converged, then scores them with the base model and
+    checks the CI stopping rule.  Texts near the decision boundary use more
+    perturbations; easy texts stop early.
+    """
+    alpha = 1 - confidence
+
+    torch.manual_seed(0)
+    np.random.seed(0)
+
+    original_text = data["original"][:n_samples]
+    sampled_text = data["sampled"][:n_samples]
+    n_texts = len(original_text)
+
+    perturb_fn = functools.partial(perturb_texts, span_length=span_length, pct=args.pct_words_masked)
+
+    # Score log p(x) once for every text (fixed throughout).
+    load_base_model()
+    print("Pre-computing log p(x) for all texts...")
+    original_lls = [get_ll(t) for t in tqdm.tqdm(original_text, desc="Scoring originals")]
+    sampled_lls  = [get_ll(t) for t in tqdm.tqdm(sampled_text,  desc="Scoring sampled")]
+
+    # Per-text accumulators.
+    orig_perturbed_lls = [[] for _ in range(n_texts)]
+    samp_perturbed_lls = [[] for _ in range(n_texts)]
+    orig_done = [False] * n_texts
+    samp_done = [False] * n_texts
+
+    round_num = 0
+    while True:
+        orig_active = [i for i in range(n_texts) if not orig_done[i]]
+        samp_active = [i for i in range(n_texts) if not samp_done[i]]
+        if not orig_active and not samp_active:
+            break
+
+        round_num += 1
+        n_orig_active = len(orig_active)
+        n_samp_active = len(samp_active)
+        print(f"Round {round_num}: {n_orig_active} originals and {n_samp_active} sampled still active")
+
+        # Generate perturbations (mask model).
+        load_mask_model()
+        orig_perturbed = []
+        samp_perturbed = []
+        if orig_active:
+            orig_to_perturb = [original_text[i] for i in orig_active for _ in range(batch_per_round)]
+            orig_perturbed = perturb_fn(orig_to_perturb)
+        if samp_active:
+            samp_to_perturb = [sampled_text[i] for i in samp_active for _ in range(batch_per_round)]
+            samp_perturbed = perturb_fn(samp_to_perturb)
+
+        # Score perturbations (base model).
+        load_base_model()
+        if orig_active:
+            orig_p_lls = get_lls(orig_perturbed)
+            for j, i in enumerate(orig_active):
+                batch = orig_p_lls[j * batch_per_round:(j + 1) * batch_per_round]
+                orig_perturbed_lls[i].extend(batch)
+                if _ci_stop(original_lls[i], orig_perturbed_lls[i], n_perturbations_min, n_perturbations_max, alpha):
+                    orig_done[i] = True
+
+        if samp_active:
+            samp_p_lls = get_lls(samp_perturbed)
+            for j, i in enumerate(samp_active):
+                batch = samp_p_lls[j * batch_per_round:(j + 1) * batch_per_round]
+                samp_perturbed_lls[i].extend(batch)
+                if _ci_stop(sampled_lls[i], samp_perturbed_lls[i], n_perturbations_min, n_perturbations_max, alpha):
+                    samp_done[i] = True
+
+    results = []
+    for idx in range(n_texts):
+        p_orig = orig_perturbed_lls[idx]
+        p_samp = samp_perturbed_lls[idx]
+        results.append({
+            "original":                   original_text[idx],
+            "sampled":                    sampled_text[idx],
+            "original_ll":                original_lls[idx],
+            "sampled_ll":                 sampled_lls[idx],
+            "perturbed_original_ll":      np.mean(p_orig),
+            "perturbed_sampled_ll":       np.mean(p_samp),
+            "perturbed_original_ll_std":  np.std(p_orig, ddof=1) if len(p_orig) > 1 else 1.0,
+            "perturbed_sampled_ll_std":   np.std(p_samp, ddof=1) if len(p_samp) > 1 else 1.0,
+            "all_perturbed_original_ll":  p_orig,
+            "all_perturbed_sampled_ll":   p_samp,
+            "k_used_original":            len(p_orig),
+            "k_used_sampled":             len(p_samp),
+        })
+    return results
+
+
+def run_adaptive_perturbation_experiment(results, criterion, confidence=0.95, n_perturbations_max=100):
+    """Compute DetectGPT predictions from adaptive-k results and report k statistics."""
+    predictions = {"real": [], "samples": []}
+    k_used_original = []
+    k_used_sampled  = []
+
+    for res in results:
+        k_used_original.append(res["k_used_original"])
+        k_used_sampled.append(res["k_used_sampled"])
+
+        std_o = res["perturbed_original_ll_std"] or 1.0
+        std_s = res["perturbed_sampled_ll_std"]  or 1.0
+
+        if criterion == "d":
+            predictions["real"].append(res["original_ll"] - res["perturbed_original_ll"])
+            predictions["samples"].append(res["sampled_ll"] - res["perturbed_sampled_ll"])
+        elif criterion == "z":
+            predictions["real"].append((res["original_ll"] - res["perturbed_original_ll"]) / std_o)
+            predictions["samples"].append((res["sampled_ll"] - res["perturbed_sampled_ll"]) / std_s)
+
+    fpr, tpr, roc_auc = get_roc_metrics(predictions["real"], predictions["samples"])
+    p, r, pr_auc = get_precision_recall_metrics(predictions["real"], predictions["samples"])
+
+    avg_k_orig = np.mean(k_used_original)
+    avg_k_samp = np.mean(k_used_sampled)
+    avg_k      = (avg_k_orig + avg_k_samp) / 2
+
+    name = f"adaptive_{criterion}_conf{int(confidence * 100)}"
+    print(f"{name} ROC AUC: {roc_auc:.4f}, PR AUC: {pr_auc:.4f}, "
+          f"avg k (orig/samp): {avg_k_orig:.1f}/{avg_k_samp:.1f}")
+
+    return {
+        "name": name,
+        "predictions": predictions,
+        "info": {
+            "confidence":      confidence,
+            "max_k":           n_perturbations_max,
+            "avg_k_original":  avg_k_orig,
+            "avg_k_sampled":   avg_k_samp,
+            "avg_k":           avg_k,
+            "k_used_original": k_used_original,
+            "k_used_sampled":  k_used_sampled,
+        },
+        "raw_results": results,
+        "metrics":    {"roc_auc": roc_auc, "fpr": fpr, "tpr": tpr},
+        "pr_metrics": {"pr_auc": pr_auc, "precision": p, "recall": r},
+        "loss": 1 - pr_auc,
+    }
+
+
+def save_k_distribution(adaptive_outputs):
+    """Plot histogram of perturbations used per text for each adaptive-k run."""
+    plt.clf()
+    n_plots = len(adaptive_outputs)
+    if n_plots == 0:
+        return
+    _, axes = plt.subplots(1, n_plots, figsize=(6 * n_plots, 4))
+    if n_plots == 1:
+        axes = [axes]
+    for ax, exp in zip(axes, adaptive_outputs):
+        info = exp["info"]
+        k_orig = info["k_used_original"]
+        k_samp = info["k_used_sampled"]
+        bins = range(0, info["max_k"] + 2, max(1, info["max_k"] // 20))
+        ax.hist(k_orig, bins=bins, alpha=0.5, label=f"original (mean={info['avg_k_original']:.1f})")
+        ax.hist(k_samp, bins=bins, alpha=0.5, label=f"sampled  (mean={info['avg_k_sampled']:.1f})")
+        ax.set_xlabel("Perturbations used (k)")
+        ax.set_ylabel("Count")
+        ax.set_title(exp["name"])
+        ax.legend()
+    plt.tight_layout()
+    plt.savefig(f"{SAVE_FOLDER}/k_distribution.png")
+    plt.close()
+
+
+# ---------------------------------------------------------------------------
+
 def run_baseline_threshold_experiment(criterion_fn, name, n_samples=500):
     torch.manual_seed(0)
     np.random.seed(0)
@@ -620,6 +824,13 @@ def generate_samples(raw_data, batch_size):
 
 
 def generate_data(dataset, key):
+    # HC3 is already paired (human answer + ChatGPT answer) — skip model generation
+    if dataset == 'hc3':
+        paired = custom_datasets.load_hc3_paired(cache_dir, n_samples=n_samples)
+        print(f"Total number of samples: {len(paired['original'])}")
+        print(f"Average number of words: {np.mean([len(x.split()) for x in paired['original']]):.1f}")
+        return paired
+
     # load data
     if dataset in custom_datasets.DATASETS:
         data = custom_datasets.load(dataset, cache_dir)
@@ -671,6 +882,9 @@ def load_base_model_and_tokenizer(name):
             base_model_kwargs.update(dict(torch_dtype=torch.float16))
         if 'gpt-j' in name:
             base_model_kwargs.update(dict(revision='float16'))
+        large_model_families = ['qwen', 'llama', 'mistral', 'falcon', 'mpt', 'bloom']
+        if args.base_half or any(k in name.lower() for k in large_model_families):
+            base_model_kwargs.update(dict(torch_dtype=torch.bfloat16))
         base_model = transformers.AutoModelForCausalLM.from_pretrained(name, **base_model_kwargs, cache_dir=cache_dir)
     else:
         base_model = None
@@ -742,8 +956,74 @@ def eval_supervised(data, model):
     }
 
 
+# ---------------------------------------------------------------------------
+# Fast-DetectGPT (analytic sampling discrepancy — no T5 mask model needed)
+# ---------------------------------------------------------------------------
+
+def get_fast_detect_gpt_score(text):
+    """Compute analytic sampling discrepancy in a single forward pass.
+
+    Uses the base model as both sampling and scoring model (white-box setting).
+    Returns a positive value for model-generated text, negative for human text.
+    """
+    tokenized = base_tokenizer(
+        text, return_tensors="pt", padding=True, return_token_type_ids=False
+    ).to(DEVICE)
+    labels = tokenized.input_ids[:, 1:].unsqueeze(-1)   # (1, T, 1)
+    with torch.no_grad():
+        logits = base_model(**tokenized).logits[:, :-1]  # (1, T, V)
+    lprobs = torch.log_softmax(logits, dim=-1)           # (1, T, V)
+    probs  = torch.softmax(logits, dim=-1)               # (1, T, V)
+    log_likelihood = lprobs.gather(dim=-1, index=labels).squeeze(-1)   # (1, T)
+    mean_ref = (probs * lprobs).sum(dim=-1)                            # (1, T)
+    var_ref  = (probs * torch.square(lprobs)).sum(dim=-1) - torch.square(mean_ref)  # (1, T)
+    discrepancy = (log_likelihood.sum(dim=-1) - mean_ref.sum(dim=-1)) / var_ref.sum(dim=-1).sqrt()
+    return discrepancy.mean().item()
+
+
+def get_fast_detect_gpt_results(n_samples=500):
+    load_base_model()
+    original_text = data["original"][:n_samples]
+    sampled_text  = data["sampled"][:n_samples]
+    results = []
+    for orig, samp in tqdm.tqdm(
+        zip(original_text, sampled_text), total=len(original_text), desc="Fast-DetectGPT"
+    ):
+        results.append({
+            "original":      orig,
+            "original_crit": get_fast_detect_gpt_score(orig),
+            "sampled":       samp,
+            "sampled_crit":  get_fast_detect_gpt_score(samp),
+        })
+    return results
+
+
+def run_fast_detect_gpt_experiment(results, n_samples=500):
+    predictions = {
+        'real':    [r["original_crit"] for r in results],
+        'samples': [r["sampled_crit"]  for r in results],
+    }
+    fpr, tpr, roc_auc = get_roc_metrics(predictions['real'], predictions['samples'])
+    p, r, pr_auc = get_precision_recall_metrics(predictions['real'], predictions['samples'])
+    print(f"Fast-DetectGPT ROC AUC: {roc_auc:.4f}, PR AUC: {pr_auc:.4f}")
+    return {
+        'name': 'fast_detect_gpt',
+        'predictions': predictions,
+        'info': {'n_samples': n_samples},
+        'metrics': {'roc_auc': roc_auc, 'fpr': fpr, 'tpr': tpr},
+        'pr_metrics': {'pr_auc': pr_auc, 'precision': p, 'recall': r},
+        'loss': 1 - pr_auc,
+    }
+
+
 if __name__ == '__main__':
-    DEVICE = "cuda"
+    if torch.cuda.is_available():
+        DEVICE = "cuda"
+    elif torch.backends.mps.is_available():
+        DEVICE = "mps"
+    else:
+        DEVICE = "cpu"
+    print(f"Using device: {DEVICE}")
 
     parser = argparse.ArgumentParser()
     parser.add_argument('--dataset', type=str, default="xsum")
@@ -778,6 +1058,20 @@ if __name__ == '__main__':
     parser.add_argument('--random_fills', action='store_true')
     parser.add_argument('--random_fills_tokens', action='store_true')
     parser.add_argument('--cache_dir', type=str, default="~/.cache")
+    # Adaptive-k arguments
+    parser.add_argument('--adaptive_k', action='store_true',
+                        help='Enable adaptive-k DetectGPT (CI-based early stopping per text)')
+    parser.add_argument('--adaptive_confidence', type=float, default=0.95,
+                        help='Confidence level for the stopping CI (default: 0.95)')
+    parser.add_argument('--adaptive_min_k', type=int, default=10,
+                        help='Minimum perturbations before stopping is allowed (default: 10)')
+    parser.add_argument('--adaptive_max_k', type=int, default=100,
+                        help='Maximum perturbations per text (default: 100)')
+    parser.add_argument('--adaptive_batch_per_round', type=int, default=10,
+                        help='Perturbations generated per round per text (default: 10)')
+    # Fast-DetectGPT
+    parser.add_argument('--fast_detect_gpt', action='store_true',
+                        help='Run Fast-DetectGPT (analytic sampling discrepancy, single forward pass, no T5 needed)')
     args = parser.parse_args()
 
     API_TOKEN_COUNTER = 0
@@ -887,6 +1181,8 @@ if __name__ == '__main__':
 
     outputs = []
 
+    adaptive_outputs = []
+
     if not args.baselines_only:
         # run perturbation experiments
         for n_perturbations in n_perturbation_list:
@@ -896,6 +1192,28 @@ if __name__ == '__main__':
                     perturbation_results, perturbation_mode, span_length=args.span_length, n_perturbations=n_perturbations, n_samples=n_samples)
                 outputs.append(output)
                 with open(os.path.join(SAVE_FOLDER, f"perturbation_{n_perturbations}_{perturbation_mode}_results.json"), "w") as f:
+                    json.dump(output, f)
+
+        # run adaptive-k DetectGPT if requested
+        if args.adaptive_k:
+            adaptive_results = get_perturbation_results_adaptive(
+                span_length=args.span_length,
+                n_perturbations_max=args.adaptive_max_k,
+                n_perturbations_min=args.adaptive_min_k,
+                batch_per_round=args.adaptive_batch_per_round,
+                confidence=args.adaptive_confidence,
+                n_samples=n_samples,
+            )
+            for perturbation_mode in ['d', 'z']:
+                output = run_adaptive_perturbation_experiment(
+                    adaptive_results, perturbation_mode,
+                    confidence=args.adaptive_confidence,
+                    n_perturbations_max=args.adaptive_max_k,
+                )
+                outputs.append(output)
+                adaptive_outputs.append(output)
+                fname = f"adaptive_{perturbation_mode}_conf{int(args.adaptive_confidence * 100)}_results.json"
+                with open(os.path.join(SAVE_FOLDER, fname), "w") as f:
                     json.dump(output, f)
 
     if not args.skip_baselines:
@@ -926,9 +1244,18 @@ if __name__ == '__main__':
 
         outputs += baseline_outputs
 
+    if args.fast_detect_gpt:
+        fdgpt_results = get_fast_detect_gpt_results(n_samples)
+        fdgpt_output = run_fast_detect_gpt_experiment(fdgpt_results, n_samples)
+        outputs.append(fdgpt_output)
+        with open(os.path.join(SAVE_FOLDER, "fast_detect_gpt_results.json"), "w") as f:
+            json.dump(fdgpt_output, f)
+
     save_roc_curves(outputs)
     save_ll_histograms(outputs)
     save_llr_histograms(outputs)
+    if adaptive_outputs:
+        save_k_distribution(adaptive_outputs)
 
     # move results folder from tmp_results/ to results/, making sure necessary directories exist
     new_folder = SAVE_FOLDER.replace("tmp_results", "results")
