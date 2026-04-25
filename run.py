@@ -17,6 +17,9 @@ import custom_datasets
 import model_backends
 from multiprocessing.pool import ThreadPool
 import time
+from huggingface_hub.errors import OfflineModeIsEnabled
+from pathlib import Path
+from contextlib import contextmanager
 
 
 
@@ -27,6 +30,61 @@ COLORS = ["#0072B2", "#009E73", "#D55E00", "#CC79A7", "#F0E442",
 
 # define regex to match all <extra_id_*> tokens, where * is an integer
 pattern = re.compile(r"<extra_id_\d+>")
+
+
+def sanitize_name(value):
+    return value.replace("/", "_")
+
+
+def offline_mode_enabled():
+    return os.environ.get("HF_HUB_OFFLINE") == "1" or os.environ.get("TRANSFORMERS_OFFLINE") == "1"
+
+
+@contextmanager
+def temporarily_disable_hf_offline():
+    old_hf = os.environ.pop("HF_HUB_OFFLINE", None)
+    old_tf = os.environ.pop("TRANSFORMERS_OFFLINE", None)
+    try:
+        yield
+    finally:
+        if old_hf is not None:
+            os.environ["HF_HUB_OFFLINE"] = old_hf
+        if old_tf is not None:
+            os.environ["TRANSFORMERS_OFFLINE"] = old_tf
+
+
+def model_cache_root(model_name):
+    return Path(cache_dir) / f"models--{model_name.replace('/', '--')}"
+
+
+def build_merged_local_snapshot(model_name, required_files):
+    root = model_cache_root(model_name)
+    snapshots_dir = root / "snapshots"
+    if not snapshots_dir.exists():
+        return None
+
+    merged_dir = root / "merged-local"
+    merged_dir.mkdir(parents=True, exist_ok=True)
+
+    available = {}
+    for snapshot in snapshots_dir.iterdir():
+        if not snapshot.is_dir():
+            continue
+        for filename in required_files:
+            candidate = snapshot / filename
+            if candidate.exists() and filename not in available:
+                available[filename] = candidate
+
+    if not all(name in available for name in required_files):
+        return None
+
+    for filename, source in available.items():
+        target = merged_dir / filename
+        if target.exists() or target.is_symlink():
+            continue
+        target.symlink_to(source)
+
+    return str(merged_dir)
 
 
 def load_base_model():
@@ -216,6 +274,34 @@ def _tinker_sample(prompt):
     )[0]
 
 
+def clean_generated_text(text):
+    original = strip_newlines(text).strip()
+    special_markers = [
+        "<|endoftext|>",
+        "<|end_of_text|>",
+        "<|eot_id|>",
+        "<｜end▁of▁sentence｜>",
+    ]
+    for marker in special_markers:
+        text = text.replace(marker, " ")
+    cleaned = strip_newlines(text).strip()
+    return cleaned or original
+
+
+def build_generation_prompts(batch_records):
+    prompts = []
+    for record in batch_records:
+        prompt = (record.get("prompt") or record["original"]).strip()
+        if not args.use_dataset_samples and args.dataset in custom_datasets.PAIR_DATASETS and record.get("prompt"):
+            prompt = (
+                "Answer the following question in a complete paragraph.\n"
+                f"Question: {prompt}\n"
+                "Answer:"
+            )
+        prompts.append(prompt)
+    return prompts
+
+
 # sample from base_model using ****only**** the first 30 tokens in each example as context
 def sample_from_model(texts, min_words=55, prompt_tokens=30, prompt_texts=None, max_tries=10):
     prompt_texts = prompt_texts or texts
@@ -232,7 +318,7 @@ def sample_from_model(texts, min_words=55, prompt_tokens=30, prompt_texts=None, 
             if tries != 0:
                 print()
                 print(f"min words: {m}, needed {min_words}, regenerating (try {tries})")
-            decoded = [_tinker_sample(prompt) for prompt in prompt_texts]
+            decoded = [clean_generated_text(_tinker_sample(prompt)) for prompt in prompt_texts]
             tries += 1
     else:
         if args.dataset == 'pubmed' and prompt_texts == texts:
@@ -248,6 +334,7 @@ def sample_from_model(texts, min_words=55, prompt_tokens=30, prompt_texts=None, 
             pool = ThreadPool(args.batch_size)
 
             decoded = pool.map(_openai_sample, prefixes)
+            decoded = [clean_generated_text(text) for text in decoded]
         else:
             decoded = ['' for _ in range(len(texts))]
 
@@ -269,8 +356,18 @@ def sample_from_model(texts, min_words=55, prompt_tokens=30, prompt_texts=None, 
                 elif args.do_top_k:
                     sampling_kwargs['top_k'] = args.top_k
                 min_length = 50 if args.dataset in ['pubmed'] else 150
-                outputs = base_model.generate(**all_encoded, min_length=min_length, max_length=200, do_sample=True, **sampling_kwargs, pad_token_id=base_tokenizer.eos_token_id, eos_token_id=base_tokenizer.eos_token_id)
+                outputs = base_model.generate(
+                    **all_encoded,
+                    min_length=min_length,
+                    max_length=200,
+                    do_sample=True,
+                    remove_invalid_values=True,
+                    **sampling_kwargs,
+                    pad_token_id=base_tokenizer.eos_token_id,
+                    eos_token_id=base_tokenizer.eos_token_id,
+                )
                 decoded = base_tokenizer.batch_decode(outputs, skip_special_tokens=True)
+                decoded = [clean_generated_text(text) for text in decoded]
                 tries += 1
 
     if args.openai_model or args.tinker_model:
@@ -294,8 +391,17 @@ def get_likelihood(logits, labels):
     return log_likelihood.mean()
 
 
+def has_enough_tokens_for_local_scoring(text):
+    if not text or not text.strip():
+        return False
+    tokenized = base_tokenizer(text, return_tensors="pt")
+    return tokenized.input_ids.shape[-1] >= 2
+
+
 # Get the log likelihood of each text under the base_model
 def get_ll(text):
+    if args.openai_model is None and args.tinker_model is None and not has_enough_tokens_for_local_scoring(text):
+        return -100.0
     if args.tinker_model:
         return tinker_backend.get_mean_logprob(text)
     if args.openai_model:        
@@ -311,7 +417,10 @@ def get_ll(text):
         with torch.no_grad():
             tokenized = base_tokenizer(text, return_tensors="pt").to(DEVICE)
             labels = tokenized.input_ids
-            return -base_model(**tokenized, labels=labels).loss.item()
+            loss = base_model(**tokenized, labels=labels).loss.item()
+            if not np.isfinite(loss):
+                return -100.0
+            return -loss
 
 
 def get_lls(texts):
@@ -358,11 +467,17 @@ def get_rank(text, log=False):
 def get_entropy(text):
     assert args.openai_model is None and args.tinker_model is None, "get_entropy only implemented for local HuggingFace models"
 
+    if not has_enough_tokens_for_local_scoring(text):
+        return 100.0
+
     with torch.no_grad():
         tokenized = base_tokenizer(text, return_tensors="pt").to(DEVICE)
         logits = base_model(**tokenized).logits[:,:-1]
         neg_entropy = F.softmax(logits, dim=-1) * F.log_softmax(logits, dim=-1)
-        return -neg_entropy.sum(-1).mean().item()
+        value = -neg_entropy.sum(-1).mean().item()
+        if not np.isfinite(value):
+            return 100.0
+        return value
 
 
 def get_roc_metrics(real_preds, sample_preds):
@@ -558,11 +673,17 @@ def run_baseline_threshold_experiment(criterion_fn, name, n_samples=500):
         sampled_text = data["sampled"][batch * batch_size:(batch + 1) * batch_size]
 
         for idx in range(len(original_text)):
+            original_crit = criterion_fn(original_text[idx])
+            sampled_crit = criterion_fn(sampled_text[idx])
+            if not np.isfinite(original_crit):
+                original_crit = -100.0
+            if not np.isfinite(sampled_crit):
+                sampled_crit = -100.0
             results.append({
                 "original": original_text[idx],
-                "original_crit": criterion_fn(original_text[idx]),
+                "original_crit": original_crit,
                 "sampled": sampled_text[idx],
-                "sampled_crit": criterion_fn(sampled_text[idx]),
+                "sampled_crit": sampled_crit,
             })
 
     # compute prediction scores for real/sampled passages
@@ -639,7 +760,7 @@ def generate_samples(raw_data, batch_size):
             target_min_words = 30
         if isinstance(batch_records[0], dict):
             original_text = [record["original"] for record in batch_records]
-            prompt_text = [record.get("prompt") or record["original"] for record in batch_records]
+            prompt_text = build_generation_prompts(batch_records)
             if args.use_dataset_samples:
                 sampled_text = [record.get("sampled") or "" for record in batch_records]
             else:
@@ -781,7 +902,9 @@ def load_base_model_and_tokenizer(name):
     if "facebook/opt-" in name:
         print("Using non-fast tokenizer for OPT")
         optional_tok_kwargs['fast'] = False
-    if args.dataset in ['pubmed']:
+    if args.dataset in ['pubmed'] or (
+        base_model is not None and not getattr(base_model.config, "is_encoder_decoder", False)
+    ):
         optional_tok_kwargs['padding_side'] = 'left'
     base_tokenizer = transformers.AutoTokenizer.from_pretrained(name, **optional_tok_kwargs, cache_dir=cache_dir)
     base_tokenizer.pad_token_id = base_tokenizer.eos_token_id
@@ -910,13 +1033,14 @@ if __name__ == '__main__':
     sampling_string = "top_k" if args.do_top_k else ("top_p" if args.do_top_p else "temp")
     output_subfolder = f"{args.output_name}/" if args.output_name else ""
     if args.tinker_model is not None:
-        base_model_name = "tinker-" + args.tinker_model.replace('/', '_')
+        base_model_name = "tinker-" + sanitize_name(args.tinker_model)
     elif args.openai_model is None:
-        base_model_name = args.base_model_name.replace('/', '_')
+        base_model_name = sanitize_name(args.base_model_name)
     else:
-        base_model_name = "openai-" + args.openai_model.replace('/', '_')
-    scoring_model_string = (f"-{args.scoring_model_name}" if args.scoring_model_name else "").replace('/', '_')
-    SAVE_FOLDER = f"tmp_results/{output_subfolder}{base_model_name}{scoring_model_string}-{args.mask_filling_model_name}-{sampling_string}/{START_DATE}-{START_TIME}-{precision_string}-{args.pct_words_masked}-{args.n_perturbation_rounds}-{args.dataset}-{args.n_samples}"
+        base_model_name = "openai-" + sanitize_name(args.openai_model)
+    scoring_model_string = sanitize_name(f"-{args.scoring_model_name}") if args.scoring_model_name else ""
+    mask_model_string = sanitize_name(args.mask_filling_model_name)
+    SAVE_FOLDER = f"tmp_results/{output_subfolder}{base_model_name}{scoring_model_string}-{mask_model_string}-{sampling_string}/{START_DATE}-{START_TIME}-{precision_string}-{args.pct_words_masked}-{args.n_perturbation_rounds}-{args.dataset}-{args.n_samples}"
     if not os.path.exists(SAVE_FOLDER):
         os.makedirs(SAVE_FOLDER)
     print(f"Saving results to absolute path: {os.path.abspath(SAVE_FOLDER)}")
@@ -944,7 +1068,15 @@ if __name__ == '__main__':
     print(f"Using cache dir {cache_dir}")
     print(f"Using API cache dir {args.api_cache_dir}")
 
-    GPT2_TOKENIZER = transformers.GPT2Tokenizer.from_pretrained('gpt2', cache_dir=cache_dir)
+    try:
+        GPT2_TOKENIZER = transformers.GPT2Tokenizer.from_pretrained(
+            'gpt2',
+            cache_dir=cache_dir,
+            local_files_only=offline_mode_enabled(),
+        )
+    except Exception:
+        with temporarily_disable_hf_offline():
+            GPT2_TOKENIZER = transformers.GPT2Tokenizer.from_pretrained('gpt2', cache_dir=cache_dir)
 
     tinker_backend = None
     if args.tinker_model is not None:
@@ -969,7 +1101,34 @@ if __name__ == '__main__':
         elif args.half:
             half_kwargs = dict(torch_dtype=torch.bfloat16)
         print(f'Loading mask filling model {mask_filling_model_name}...')
-        mask_model = transformers.AutoModelForSeq2SeqLM.from_pretrained(mask_filling_model_name, **int8_kwargs, **half_kwargs, cache_dir=cache_dir)
+        local_mask_model_dir = None
+        if offline_mode_enabled():
+            local_mask_model_dir = build_merged_local_snapshot(
+                mask_filling_model_name,
+                ["config.json", "model.safetensors"],
+            )
+        mask_model_source = local_mask_model_dir or mask_filling_model_name
+        mask_model_load_kwargs = dict(
+            use_safetensors=True,
+            local_files_only=offline_mode_enabled(),
+            **int8_kwargs,
+            **half_kwargs,
+            cache_dir=cache_dir,
+        )
+        try:
+            mask_model = transformers.AutoModelForSeq2SeqLM.from_pretrained(
+                mask_model_source,
+                **mask_model_load_kwargs,
+            )
+        except Exception:
+            with temporarily_disable_hf_offline():
+                mask_model = transformers.AutoModelForSeq2SeqLM.from_pretrained(
+                    mask_filling_model_name,
+                    use_safetensors=True,
+                    **int8_kwargs,
+                    **half_kwargs,
+                    cache_dir=cache_dir,
+                )
         try:
             n_positions = mask_model.config.n_positions
         except AttributeError:
@@ -977,7 +1136,27 @@ if __name__ == '__main__':
     else:
         n_positions = 512
     preproc_tokenizer = transformers.AutoTokenizer.from_pretrained('t5-small', model_max_length=512, cache_dir=cache_dir)
-    mask_tokenizer = transformers.AutoTokenizer.from_pretrained(mask_filling_model_name, model_max_length=n_positions, cache_dir=cache_dir)
+    mask_tokenizer_kwargs = dict(
+        model_max_length=n_positions,
+        cache_dir=cache_dir,
+        local_files_only=offline_mode_enabled(),
+    )
+    if "t5" in mask_filling_model_name.lower():
+        mask_tokenizer_kwargs["use_fast"] = False
+    try:
+        mask_tokenizer = transformers.AutoTokenizer.from_pretrained(
+            mask_filling_model_name,
+            **mask_tokenizer_kwargs,
+        )
+    except Exception:
+        with temporarily_disable_hf_offline():
+            retry_kwargs = dict(model_max_length=n_positions, cache_dir=cache_dir)
+            if "t5" in mask_filling_model_name.lower():
+                retry_kwargs["use_fast"] = False
+            mask_tokenizer = transformers.AutoTokenizer.from_pretrained(
+                mask_filling_model_name,
+                **retry_kwargs,
+            )
     if args.dataset in ['english', 'german']:
         preproc_tokenizer = mask_tokenizer
 
