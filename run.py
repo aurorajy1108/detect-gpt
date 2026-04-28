@@ -824,6 +824,20 @@ def generate_samples(raw_data, batch_size):
 
 
 def generate_data(dataset, key):
+    # Load from a pre-formatted manifest JSON (array of {original, sampled, ...})
+    if args.data_file:
+        with open(args.data_file) as f:
+            records = json.load(f)
+        if n_samples:
+            records = records[:n_samples]
+        paired = {
+            "original": [r["original"] for r in records],
+            "sampled":  [r["sampled"]  for r in records],
+        }
+        print(f"Total number of samples: {len(paired['original'])}")
+        print(f"Average number of words: {np.mean([len(x.split()) for x in paired['original']]):.1f}")
+        return paired
+
     # HC3 is already paired (human answer + ChatGPT answer) — skip model generation
     if dataset == 'hc3':
         paired = custom_datasets.load_hc3_paired(cache_dir, n_samples=n_samples)
@@ -1052,6 +1066,9 @@ if __name__ == '__main__':
     parser.add_argument('--baselines_only', action='store_true')
     parser.add_argument('--skip_baselines', action='store_true')
     parser.add_argument('--buffer_size', type=int, default=1)
+    parser.add_argument('--data_file', type=str, default="",
+                        help='Path to a pre-formatted JSON manifest (array of {original, sampled}). '
+                             'Bypasses dataset loading and model generation.')
     parser.add_argument('--mask_top_p', type=float, default=1.0)
     parser.add_argument('--pre_perturb_pct', type=float, default=0.0)
     parser.add_argument('--pre_perturb_span_length', type=int, default=5)
@@ -1110,7 +1127,7 @@ if __name__ == '__main__':
     n_perturbation_rounds = args.n_perturbation_rounds
     n_similarity_samples = args.n_similarity_samples
 
-    cache_dir = args.cache_dir
+    cache_dir = os.path.expanduser(args.cache_dir)
     os.environ["XDG_CACHE_HOME"] = cache_dir
     if not os.path.exists(cache_dir):
         os.makedirs(cache_dir)
