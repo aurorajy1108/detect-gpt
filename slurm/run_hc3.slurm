@@ -33,8 +33,12 @@ export TRANSFORMERS_CACHE=$HF_HOME
 export HF_DATASETS_CACHE=$HF_HOME
 mkdir -p $HF_HOME
 
+if [ -z "$HF_TOKEN" ] && [ -f $HOME/.cache/huggingface/token ]; then
+  export HF_TOKEN=$(cat $HOME/.cache/huggingface/token)
+fi
 if [ -z "$HF_TOKEN" ]; then
-  echo "ERROR: HF_TOKEN not set. Run: export HF_TOKEN=hf_xxx before sbatch"
+  echo "ERROR: HF_TOKEN not set and no cached token at ~/.cache/huggingface/token"
+  echo "Run: huggingface-cli login   OR   export HF_TOKEN=hf_xxx"
   exit 1
 fi
 
