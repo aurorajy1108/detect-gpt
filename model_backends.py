@@ -124,7 +124,10 @@ class TinkerSamplingBackend:
                 num_samples=num_samples,
                 sampling_params=self.types.SamplingParams(**params),
             )
-            return [self.tokenizer.decode(sequence.tokens) for sequence in result.sequences]
+            return [
+                self.tokenizer.decode(sequence.tokens, skip_special_tokens=True).strip()
+                for sequence in result.sequences
+            ]
 
         sequences = self._run_async(_sample())
         if self.sample_cache is not None:
@@ -143,11 +146,11 @@ class TinkerSamplingBackend:
             raise ValueError("Unsupported Tinker logprob response format")
 
         normalized = [value for value in values if value is not None]
-        if not normalized:
-            raise ValueError("No token logprobs returned by Tinker")
         return normalized
 
     def get_mean_logprob(self, text):
+        if not text.strip():
+            return -100.0
         cache_payload = {
             "kind": "mean_logprob",
             "model_name": self.model_name,
@@ -162,7 +165,8 @@ class TinkerSamplingBackend:
             return await self.sampling_client.compute_logprobs_async(self._model_input(text))
 
         result = self._run_async(_compute())
-        mean_logprob = float(np.mean(self._normalize_logprobs(result)))
+        normalized = self._normalize_logprobs(result)
+        mean_logprob = -100.0 if not normalized else float(np.mean(normalized))
         if self.logprob_cache is not None:
             self.logprob_cache.set(cache_payload, {"mean_logprob": mean_logprob})
         return mean_logprob

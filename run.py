@@ -87,6 +87,30 @@ def build_merged_local_snapshot(model_name, required_files):
     return str(merged_dir)
 
 
+def get_gpt2_tokenizer():
+    global GPT2_TOKENIZER
+    if GPT2_TOKENIZER is not None:
+        return GPT2_TOKENIZER
+    try:
+        GPT2_TOKENIZER = transformers.GPT2Tokenizer.from_pretrained(
+            'gpt2',
+            cache_dir=cache_dir,
+            local_files_only=offline_mode_enabled(),
+        )
+    except Exception:
+        with temporarily_disable_hf_offline():
+            GPT2_TOKENIZER = transformers.GPT2Tokenizer.from_pretrained('gpt2', cache_dir=cache_dir)
+    return GPT2_TOKENIZER
+
+
+def count_tokens_for_api_texts(texts):
+    if args.tinker_model is not None and tinker_backend is not None:
+        tokenizer = tinker_backend.tokenizer
+    else:
+        tokenizer = get_gpt2_tokenizer()
+    return sum(len(tokenizer.encode(text)) for text in texts)
+
+
 def load_base_model():
     print('MOVING BASE MODEL TO GPU...', end='', flush=True)
     start = time.time()
@@ -149,7 +173,15 @@ def replace_masks(texts):
     n_expected = count_masks(texts)
     stop_id = mask_tokenizer.encode(f"<extra_id_{max(n_expected)}>")[0]
     tokens = mask_tokenizer(texts, return_tensors="pt", padding=True).to(DEVICE)
-    outputs = mask_model.generate(**tokens, max_length=150, do_sample=True, top_p=args.mask_top_p, num_return_sequences=1, eos_token_id=stop_id)
+    generation_max_length = max(150, 8 * max(n_expected))
+    outputs = mask_model.generate(
+        **tokens,
+        max_length=generation_max_length,
+        do_sample=True,
+        top_p=args.mask_top_p,
+        num_return_sequences=1,
+        eos_token_id=stop_id,
+    )
     return mask_tokenizer.batch_decode(outputs, skip_special_tokens=False)
 
 
@@ -185,6 +217,13 @@ def apply_extracted_fills(masked_texts, extracted_fills):
     return texts
 
 
+def resolve_failed_perturbations(perturbed_texts, original_texts, failed_idxs):
+    for idx in failed_idxs:
+        # Fall back to the original text so one stubborn sample doesn't stall the whole run.
+        perturbed_texts[idx] = original_texts[idx]
+    return perturbed_texts
+
+
 def perturb_texts_(texts, span_length, pct, ceil_pct=False):
     if not args.random_fills:
         masked_texts = [tokenize_and_mask(x, span_length, pct, ceil_pct) for x in texts]
@@ -196,6 +235,13 @@ def perturb_texts_(texts, span_length, pct, ceil_pct=False):
         attempts = 1
         while '' in perturbed_texts:
             idxs = [idx for idx, x in enumerate(perturbed_texts) if x == '']
+            if attempts > args.max_perturbation_retries:
+                print(
+                    f'WARNING: {len(idxs)} texts still have no fills after '
+                    f'{args.max_perturbation_retries} retries. Falling back to original text.'
+                )
+                perturbed_texts = resolve_failed_perturbations(perturbed_texts, texts, idxs)
+                break
             print(f'WARNING: {len(idxs)} texts have no fills. Trying again [attempt {attempts}].')
             masked_texts = [tokenize_and_mask(x, span_length, pct, ceil_pct) for idx, x in enumerate(texts) if idx in idxs]
             raw_fills = replace_masks(masked_texts)
@@ -288,6 +334,29 @@ def clean_generated_text(text):
     return cleaned or original
 
 
+def combine_prompt_and_generation(prompt, generated):
+    prompt = strip_newlines(prompt).strip()
+    generated = clean_generated_text(generated)
+    if not prompt:
+        return generated
+    if generated.startswith(prompt):
+        return generated
+    return f"{prompt} {generated}".strip()
+
+
+def build_prefixes_from_tokenizer(texts, prompt_tokens):
+    prefixes = []
+    for text in texts:
+        encoded = base_tokenizer(
+            text,
+            add_special_tokens=False,
+            return_attention_mask=False,
+        )["input_ids"]
+        prefix_ids = encoded[:prompt_tokens]
+        prefixes.append(base_tokenizer.decode(prefix_ids, skip_special_tokens=True))
+    return prefixes
+
+
 def build_generation_prompts(batch_records):
     prompts = []
     for record in batch_records:
@@ -308,6 +377,10 @@ def sample_from_model(texts, min_words=55, prompt_tokens=30, prompt_texts=None, 
 
     # encode each text as a list of token ids
     if args.tinker_model:
+        if args.dataset in custom_datasets.PAIR_DATASETS:
+            effective_prompts = prompt_texts
+        else:
+            effective_prompts = build_prefixes_from_tokenizer(prompt_texts, prompt_tokens)
         decoded = ['' for _ in range(len(prompt_texts))]
         tries = 0
         while (m := min(len(x.split()) for x in decoded)) < min_words:
@@ -318,15 +391,21 @@ def sample_from_model(texts, min_words=55, prompt_tokens=30, prompt_texts=None, 
             if tries != 0:
                 print()
                 print(f"min words: {m}, needed {min_words}, regenerating (try {tries})")
-            decoded = [clean_generated_text(_tinker_sample(prompt)) for prompt in prompt_texts]
+            decoded = []
+            for prompt in effective_prompts:
+                generated = _tinker_sample(prompt)
+                if args.dataset in custom_datasets.PAIR_DATASETS:
+                    decoded.append(clean_generated_text(generated))
+                else:
+                    decoded.append(combine_prompt_and_generation(prompt, generated))
             tries += 1
     else:
         if args.dataset == 'pubmed' and prompt_texts == texts:
             texts = [t[:t.index(custom_datasets.SEPARATOR)] for t in texts]
             all_encoded = base_tokenizer(texts, return_tensors="pt", padding=True).to(DEVICE)
         else:
-            all_encoded = base_tokenizer(prompt_texts, return_tensors="pt", padding=True).to(DEVICE)
-            all_encoded = {key: value[:, :prompt_tokens] for key, value in all_encoded.items()}
+            effective_prompts = build_prefixes_from_tokenizer(prompt_texts, prompt_tokens)
+            all_encoded = base_tokenizer(effective_prompts, return_tensors="pt", padding=True).to(DEVICE)
 
         if args.openai_model:
             # decode the prefixes back into text
@@ -373,8 +452,7 @@ def sample_from_model(texts, min_words=55, prompt_tokens=30, prompt_texts=None, 
     if args.openai_model or args.tinker_model:
         global API_TOKEN_COUNTER
 
-        # count total number of tokens with GPT2_TOKENIZER
-        total_tokens = sum(len(GPT2_TOKENIZER.encode(x)) for x in decoded)
+        total_tokens = count_tokens_for_api_texts(decoded)
         API_TOKEN_COUNTER += total_tokens
 
     return decoded
@@ -389,6 +467,13 @@ def get_likelihood(logits, labels):
     log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
     log_likelihood = log_probs.gather(dim=-1, index=labels.unsqueeze(-1)).squeeze(-1)
     return log_likelihood.mean()
+
+
+def sanitize_local_logits(logits):
+    # Some local GPT-style checkpoints can emit rare NaN/Inf/extreme logits under the
+    # current torch/transformers stack on this machine. Clean them before scoring.
+    logits = torch.nan_to_num(logits, nan=0.0, posinf=0.0, neginf=0.0)
+    return torch.clamp(logits, min=-100.0, max=100.0)
 
 
 def has_enough_tokens_for_local_scoring(text):
@@ -417,10 +502,12 @@ def get_ll(text):
         with torch.no_grad():
             tokenized = base_tokenizer(text, return_tensors="pt").to(DEVICE)
             labels = tokenized.input_ids
-            loss = base_model(**tokenized, labels=labels).loss.item()
-            if not np.isfinite(loss):
+            logits = base_model(**tokenized).logits
+            logits = sanitize_local_logits(logits)
+            value = get_likelihood(logits, labels).item()
+            if not np.isfinite(value):
                 return -100.0
-            return -loss
+            return value
 
 
 def get_lls(texts):
@@ -429,8 +516,7 @@ def get_lls(texts):
     else:
         global API_TOKEN_COUNTER
 
-        # use GPT2_TOKENIZER to get total number of tokens
-        total_tokens = sum(len(GPT2_TOKENIZER.encode(text)) for text in texts)
+        total_tokens = count_tokens_for_api_texts(texts)
         API_TOKEN_COUNTER += total_tokens * 2  # multiply by two because OpenAI double-counts echo_prompt tokens
 
         pool = ThreadPool(args.batch_size)
@@ -444,6 +530,7 @@ def get_rank(text, log=False):
     with torch.no_grad():
         tokenized = base_tokenizer(text, return_tensors="pt").to(DEVICE)
         logits = base_model(**tokenized).logits[:,:-1]
+        logits = sanitize_local_logits(logits)
         labels = tokenized.input_ids[:,1:]
 
         # get rank of each label token in the model's likelihood ordering
@@ -473,6 +560,7 @@ def get_entropy(text):
     with torch.no_grad():
         tokenized = base_tokenizer(text, return_tensors="pt").to(DEVICE)
         logits = base_model(**tokenized).logits[:,:-1]
+        logits = sanitize_local_logits(logits)
         neg_entropy = F.softmax(logits, dim=-1) * F.log_softmax(logits, dim=-1)
         value = -neg_entropy.sum(-1).mean().item()
         if not np.isfinite(value):
@@ -1012,6 +1100,7 @@ if __name__ == '__main__':
     parser.add_argument('--random_fills_tokens', action='store_true')
     parser.add_argument('--min_sample_words', type=int, default=55)
     parser.add_argument('--max_sample_tries', type=int, default=10)
+    parser.add_argument('--max_perturbation_retries', type=int, default=3)
     parser.add_argument('--cache_dir', type=str, default="~/.cache")
     args = parser.parse_args()
 
@@ -1068,15 +1157,7 @@ if __name__ == '__main__':
     print(f"Using cache dir {cache_dir}")
     print(f"Using API cache dir {args.api_cache_dir}")
 
-    try:
-        GPT2_TOKENIZER = transformers.GPT2Tokenizer.from_pretrained(
-            'gpt2',
-            cache_dir=cache_dir,
-            local_files_only=offline_mode_enabled(),
-        )
-    except Exception:
-        with temporarily_disable_hf_offline():
-            GPT2_TOKENIZER = transformers.GPT2Tokenizer.from_pretrained('gpt2', cache_dir=cache_dir)
+    GPT2_TOKENIZER = None
 
     tinker_backend = None
     if args.tinker_model is not None:
