@@ -44,6 +44,12 @@ DATASET_MATRIX = [
         "source": "finance",
         "mask_model": "google/mt5-large",
     },
+    {
+        "dataset": "xsum",
+        "language": "en",
+        "source": "xsum",
+        "mask_model": "t5-large",
+    }
 ]
 
 

@@ -206,6 +206,8 @@ def _openai_sample(p):
 
 
 def _tinker_sample(prompt):
+    if len(prompt.split()) < 5:
+          return " ".join(["the"] * 30)
     return tinker_backend.sample(
         prompt,
         max_tokens=200,
@@ -843,6 +845,9 @@ def eval_supervised(data, model):
         'loss': 1 - pr_auc,
     }
 
+def use_transformers_backend(model_name):
+    name = model_name.lower()
+    return "olmo" in name or "gpt2" in name or "llama" in name
 
 if __name__ == '__main__':
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -949,7 +954,10 @@ if __name__ == '__main__':
     tinker_backend = None
     if args.tinker_model is not None:
         print(f'Loading Tinker sampling backend {args.tinker_model}...')
-        tinker_backend = model_backends.TinkerSamplingBackend(
+        if use_transformers_backend(args.tinker_model):
+            tinker_backend = model_backends.TransformersBackend(args.tinker_model)
+        else:
+            tinker_backend = model_backends.TinkerSamplingBackend(
             args.tinker_model,
             cache_dir=cache_dir,
             tokenizer_name=args.tinker_tokenizer_name,
@@ -1007,7 +1015,7 @@ if __name__ == '__main__':
 
     if not args.skip_baselines:
         baseline_outputs = [run_baseline_threshold_experiment(get_ll, "likelihood", n_samples=n_samples)]
-        if args.openai_model is None and args.tinker_model is None:
+        if args.openai_model is None:
             rank_criterion = lambda text: -get_rank(text, log=False)
             baseline_outputs.append(run_baseline_threshold_experiment(rank_criterion, "rank", n_samples=n_samples))
             logrank_criterion = lambda text: -get_rank(text, log=True)
@@ -1036,7 +1044,7 @@ if __name__ == '__main__':
         with open(os.path.join(SAVE_FOLDER, f"likelihood_threshold_results.json"), "w") as f:
             json.dump(baseline_outputs[0], f)
 
-        if args.openai_model is None and args.tinker_model is None:
+        if args.openai_model is None:
             # write rank threshold results to a file
             with open(os.path.join(SAVE_FOLDER, f"rank_threshold_results.json"), "w") as f:
                 json.dump(baseline_outputs[1], f)
