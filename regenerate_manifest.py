@@ -35,7 +35,11 @@ def main():
     ap.add_argument("--top_p", type=float, default=0.95)
     ap.add_argument("--cache_dir", default=os.path.expanduser("~/.cache"))
     ap.add_argument("--prompt_template", type=str, default=None,
-                    help="Template with {prompt}. If None, just use the raw prompt.")
+                    help="Template with {prompt}. Default: 'Question: {prompt}\\n\\nAnswer:'")
+    ap.add_argument("--min_words", type=int, default=20,
+                    help="Re-sample if generation has fewer words")
+    ap.add_argument("--max_retries", type=int, default=3,
+                    help="Max regeneration retries for short outputs")
     args = ap.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
@@ -56,14 +60,13 @@ def main():
     records = records[: args.n_samples]
     print(f"Regenerating {len(records)} samples...")
 
-    out_records = []
-    t0 = time.time()
-    for r in tqdm(records, desc="Generating"):
-        prompt = r["prompt"]
-        if args.prompt_template:
-            prompt = args.prompt_template.format(prompt=prompt)
+    # Default template nudges base models to actually answer
+    template = args.prompt_template or "Question: {prompt}\n\nAnswer:"
 
-        inputs = tok(prompt, return_tensors="pt", truncation=True, max_length=1024).to(device)
+    def gen_one(prompt_text, seed=None):
+        if seed is not None:
+            torch.manual_seed(seed)
+        inputs = tok(prompt_text, return_tensors="pt", truncation=True, max_length=1024).to(device)
         with torch.no_grad():
             out = model.generate(
                 **inputs,
@@ -73,9 +76,22 @@ def main():
                 top_p=args.top_p,
                 pad_token_id=tok.pad_token_id,
             )
-        # strip the prompt tokens
         new_tokens = out[0, inputs.input_ids.shape[1]:]
-        generated = tok.decode(new_tokens, skip_special_tokens=True).strip().replace("\n", " ")
+        return tok.decode(new_tokens, skip_special_tokens=True).strip().replace("\n", " ")
+
+    out_records = []
+    t0 = time.time()
+    for i, r in enumerate(tqdm(records, desc="Generating")):
+        prompt = template.format(prompt=r["prompt"])
+        generated = gen_one(prompt)
+        # Retry if empty / too short — happens with base models on QA prompts
+        for retry in range(args.max_retries):
+            if len(generated.split()) >= args.min_words:
+                break
+            generated = gen_one(prompt, seed=1000 + i * 10 + retry)
+        if len(generated.split()) < args.min_words:
+            # Final fallback: pad with original prompt continuation
+            generated = (generated + " " + r["prompt"])[: args.max_new_tokens * 5]
         out_records.append({**r, "sampled": generated})
 
     print(f"Generation took {time.time()-t0:.1f}s")
