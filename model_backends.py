@@ -7,6 +7,8 @@ from pathlib import Path
 
 import numpy as np
 import transformers
+from transformers import AutoTokenizer, AutoModelForCausalLM
+import torch
 
 
 def _stable_key(payload):
@@ -166,3 +168,67 @@ class TinkerSamplingBackend:
         if self.logprob_cache is not None:
             self.logprob_cache.set(cache_payload, {"mean_logprob": mean_logprob})
         return mean_logprob
+
+
+class TransformersBackend:
+    def __init__(self, model_name):
+        print(f"[HF Backend] Loading {model_name}")
+
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            device_map="auto",
+            torch_dtype=torch.float16,
+        )
+
+        self.model.eval()
+    def _to_device(self, inputs):
+      return {k: v.to(self.model.device) for k, v in inputs.items()}
+
+    def sample(self, prompt, max_tokens=200, temperature=1.0, top_p=None, top_k=None, num_samples=1):
+        if hasattr(self.tokenizer, 'chat_template') and self.tokenizer.chat_template is not None:
+            messages = [{"role": "user", "content": prompt}]
+            formatted = self.tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True,
+            )
+        else:
+            formatted = prompt
+
+        inputs = self._to_device(
+            self.tokenizer(
+                formatted,
+                return_tensors="pt",
+                truncation=True,
+                max_length=512,
+            )
+        )
+        gen_kwargs = dict(
+            max_new_tokens=max_tokens,
+            min_new_tokens=50,
+            do_sample=True,
+            temperature=temperature,
+        )
+        if top_p is not None:
+            gen_kwargs['top_p'] = top_p
+        if top_k is not None:
+            gen_kwargs['top_k'] = top_k
+        with torch.no_grad():
+            outputs = self.model.generate(**inputs, **gen_kwargs)
+        input_len = inputs['input_ids'].shape[1]
+        return [
+            self.tokenizer.decode(outputs[i][input_len:], skip_special_tokens=True)
+            for i in range(outputs.shape[0])
+        ]
+
+    def get_mean_logprob(self, text):
+        inputs = self.tokenizer(
+            text,
+            return_tensors="pt",
+            truncation=True,
+            max_length=1024,    # ← add this
+        ).to(self.model.device)
+
+        with torch.no_grad():
+            outputs = self.model(**inputs, labels=inputs["input_ids"])
+            return -outputs.loss.item()
