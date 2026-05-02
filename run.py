@@ -13,6 +13,7 @@ import datetime
 import os
 import json
 import functools
+import hashlib
 import custom_datasets
 import model_backends
 from multiprocessing.pool import ThreadPool
@@ -30,6 +31,8 @@ COLORS = ["#0072B2", "#009E73", "#D55E00", "#CC79A7", "#F0E442",
 
 # define regex to match all <extra_id_*> tokens, where * is an integer
 pattern = re.compile(r"<extra_id_\d+>")
+resolved_model_backend = "auto"
+current_loaded_model = None
 
 
 def sanitize_name(value):
@@ -111,26 +114,133 @@ def count_tokens_for_api_texts(texts):
     return sum(len(tokenizer.encode(text)) for text in texts)
 
 
+def using_local_transformers_backend():
+    if args.openai_model is not None:
+        return False
+    if args.tinker_model is None:
+        return True
+    return resolved_model_backend == "hf"
+
+
+def get_safe_args_dict(args):
+    safe_args = dict(args.__dict__)
+    for secret_key in ['openai_key', 'tinker_api_key']:
+        if safe_args.get(secret_key):
+            safe_args[secret_key] = "***REDACTED***"
+    return safe_args
+
+
+def build_result_folder_prefix(args, resolved_backend):
+    sampling_string = "top_k" if args.do_top_k else ("top_p" if args.do_top_p else "temp")
+    output_subfolder = f"{args.output_name}/" if args.output_name else ""
+    if args.tinker_model is not None:
+        backend_prefix = "hf-" if resolved_backend == "hf" else "tinker-"
+        base_model_name = backend_prefix + sanitize_name(args.tinker_model)
+    elif args.openai_model is None:
+        base_model_name = sanitize_name(args.base_model_name)
+    else:
+        base_model_name = "openai-" + sanitize_name(args.openai_model)
+    scoring_model_string = sanitize_name(f"-{args.scoring_model_name}") if args.scoring_model_name else ""
+    mask_model_string = sanitize_name(args.mask_filling_model_name)
+    return f"{output_subfolder}{base_model_name}{scoring_model_string}-{mask_model_string}-{sampling_string}"
+
+
+def build_run_cache_signature(safe_args, resolved_backend):
+    payload = {
+        "resolved_model_backend": resolved_backend,
+        "args": safe_args,
+    }
+    encoded = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def expected_result_filenames(args, resolved_backend, n_perturbation_list):
+    expected = {"args.json", "raw_data.json"}
+    local_backend = args.openai_model is None and (args.tinker_model is None or resolved_backend == "hf")
+
+    if not args.skip_baselines:
+        expected.update({
+            "likelihood_threshold_results.json",
+            "roberta-base-openai-detector_results.json",
+            "roberta-large-openai-detector_results.json",
+        })
+        if local_backend:
+            expected.update({
+                "rank_threshold_results.json",
+                "logrank_threshold_results.json",
+                "entropy_threshold_results.json",
+            })
+
+    if not args.baselines_only:
+        for n_perturbations in n_perturbation_list:
+            expected.add(f"perturbation_{n_perturbations}_d_results.json")
+            expected.add(f"perturbation_{n_perturbations}_z_results.json")
+
+    return expected
+
+
+def find_completed_cached_run(results_root, safe_args, signature, expected_files):
+    if not os.path.isdir(results_root):
+        return None
+
+    for entry in sorted(os.listdir(results_root)):
+        candidate = os.path.join(results_root, entry)
+        if not os.path.isdir(candidate):
+            continue
+
+        meta_path = os.path.join(candidate, "run_cache_meta.json")
+        if os.path.exists(meta_path):
+            try:
+                meta = json.load(open(meta_path, "r", encoding="utf-8"))
+            except Exception:
+                meta = None
+            if meta and meta.get("signature") == signature and meta.get("completed") is True:
+                if all(os.path.exists(os.path.join(candidate, name)) for name in expected_files):
+                    return candidate
+
+        args_path = os.path.join(candidate, "args.json")
+        if not os.path.exists(args_path):
+            continue
+        try:
+            saved_args = json.load(open(args_path, "r", encoding="utf-8"))
+        except Exception:
+            continue
+        if saved_args == safe_args and all(os.path.exists(os.path.join(candidate, name)) for name in expected_files):
+            return candidate
+
+    return None
+
+
 def load_base_model():
     print('MOVING BASE MODEL TO GPU...', end='', flush=True)
     start = time.time()
+    global current_loaded_model
+    if current_loaded_model == "base":
+        print(f'DONE ({time.time() - start:.2f}s)')
+        return
     try:
-        mask_model.cpu()
+        if current_loaded_model == "mask":
+            mask_model.cpu()
     except NameError:
         pass
-    if args.openai_model is None and args.tinker_model is None and base_model is not None:
+    if using_local_transformers_backend() and base_model is not None:
         base_model.to(DEVICE)
+    current_loaded_model = "base"
     print(f'DONE ({time.time() - start:.2f}s)')
 
 
 def load_mask_model():
     print('MOVING MASK MODEL TO GPU...', end='', flush=True)
     start = time.time()
-
-    if args.openai_model is None and args.tinker_model is None and base_model is not None:
+    global current_loaded_model
+    if current_loaded_model == "mask":
+        print(f'DONE ({time.time() - start:.2f}s)')
+        return
+    if using_local_transformers_backend() and base_model is not None and current_loaded_model == "base":
         base_model.cpu()
     if not args.random_fills:
         mask_model.to(DEVICE)
+    current_loaded_model = "mask"
     print(f'DONE ({time.time() - start:.2f}s)')
 
 
@@ -510,9 +620,50 @@ def get_ll(text):
             return value
 
 
+def get_lls_local_batched(texts):
+    if not texts:
+        return []
+
+    if args.tinker_model and resolved_model_backend == "hf" and hasattr(tinker_backend, "get_mean_logprobs"):
+        return tinker_backend.get_mean_logprobs(texts, batch_size=args.batch_size)
+
+    results = []
+    for start in range(0, len(texts), args.batch_size):
+        batch = texts[start:start + args.batch_size]
+        tokenized = base_tokenizer(
+            batch,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=1024,
+        ).to(DEVICE)
+
+        with torch.no_grad():
+            logits = base_model(
+                input_ids=tokenized["input_ids"],
+                attention_mask=tokenized.get("attention_mask"),
+            ).logits
+
+        shift_logits = logits[:, :-1, :]
+        shift_labels = tokenized["input_ids"][:, 1:]
+        if "attention_mask" in tokenized:
+            shift_mask = tokenized["attention_mask"][:, 1:].float()
+        else:
+            shift_mask = torch.ones_like(shift_labels, dtype=torch.float32)
+
+        log_probs = torch.nn.functional.log_softmax(shift_logits, dim=-1)
+        token_log_probs = log_probs.gather(dim=-1, index=shift_labels.unsqueeze(-1)).squeeze(-1)
+        token_log_probs = token_log_probs * shift_mask
+        lengths = shift_mask.sum(dim=-1).clamp_min(1.0)
+        batch_means = token_log_probs.sum(dim=-1) / lengths
+        results.extend(batch_means.detach().cpu().tolist())
+
+    return [float(x) for x in results]
+
+
 def get_lls(texts):
-    if not args.openai_model and not args.tinker_model:
-        return [get_ll(text) for text in texts]
+    if using_local_transformers_backend():
+        return get_lls_local_batched(texts)
     else:
         global API_TOKEN_COUNTER
 
@@ -525,7 +676,7 @@ def get_lls(texts):
 
 # get the average rank of each observed token sorted by model likelihood
 def get_rank(text, log=False):
-    assert args.openai_model is None and args.tinker_model is None, "get_rank only implemented for local HuggingFace models"
+    assert using_local_transformers_backend(), "get_rank only implemented for local HuggingFace models"
 
     with torch.no_grad():
         tokenized = base_tokenizer(text, return_tensors="pt").to(DEVICE)
@@ -552,7 +703,7 @@ def get_rank(text, log=False):
 
 # get average entropy of each token in the text
 def get_entropy(text):
-    assert args.openai_model is None and args.tinker_model is None, "get_entropy only implemented for local HuggingFace models"
+    assert using_local_transformers_backend(), "get_entropy only implemented for local HuggingFace models"
 
     if not has_enough_tokens_for_local_scoring(text):
         return 100.0
@@ -972,8 +1123,10 @@ def generate_data(dataset, key):
 
 
 def load_base_model_and_tokenizer(name):
-    if args.tinker_model is not None:
+    if args.tinker_model is not None and not using_local_transformers_backend():
         return None, tinker_backend.tokenizer
+    if args.tinker_model is not None and using_local_transformers_backend():
+        return tinker_backend.model, tinker_backend.tokenizer
 
     if args.openai_model is None:
         print(f'Loading BASE model {args.base_model_name}...')
@@ -1055,6 +1208,19 @@ def eval_supervised(data, model):
     }
 
 
+def use_transformers_backend(model_name):
+    name = model_name.lower()
+    return "olmo" in name or "gpt2" in name or "llama" in name
+
+
+def resolve_model_backend(args):
+    if args.tinker_model is None:
+        return "auto"
+    if args.model_backend == "auto":
+        return "hf" if use_transformers_backend(args.tinker_model) else "tinker"
+    return args.model_backend
+
+
 if __name__ == '__main__':
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -1089,6 +1255,8 @@ if __name__ == '__main__':
     parser.add_argument('--tinker_model', type=str, default=None)
     parser.add_argument('--tinker_tokenizer_name', type=str, default=None)
     parser.add_argument('--tinker_api_key', type=str, default=None)
+    parser.add_argument('--model_backend', type=str, choices=['auto', 'tinker', 'hf'], default='auto')
+    parser.add_argument('--hf_quantization', type=str, choices=['none', '4bit', '8bit'], default='none')
     parser.add_argument('--api_cache_dir', type=str, default="api_cache")
     parser.add_argument('--baselines_only', action='store_true')
     parser.add_argument('--skip_baselines', action='store_true')
@@ -1102,6 +1270,7 @@ if __name__ == '__main__':
     parser.add_argument('--max_sample_tries', type=int, default=10)
     parser.add_argument('--max_perturbation_retries', type=int, default=3)
     parser.add_argument('--cache_dir', type=str, default="~/.cache")
+    parser.add_argument('--force_rerun', action='store_true')
     args = parser.parse_args()
 
     API_TOKEN_COUNTER = 0
@@ -1112,40 +1281,41 @@ if __name__ == '__main__':
         openai.api_key = args.openai_key
     if args.openai_model is not None and args.tinker_model is not None:
         raise ValueError("Choose either --openai_model or --tinker_model, not both")
+    resolved_model_backend = resolve_model_backend(args)
 
     START_DATE = datetime.datetime.now().strftime('%Y-%m-%d')
     START_TIME = datetime.datetime.now().strftime('%H-%M-%S-%f')
 
+    safe_args = get_safe_args_dict(args)
+    n_perturbation_list = [int(x) for x in args.n_perturbation_list.split(",")]
+    result_folder_prefix = build_result_folder_prefix(args, resolved_model_backend)
+    run_signature = build_run_cache_signature(safe_args, resolved_model_backend)
+    expected_files = expected_result_filenames(args, resolved_model_backend, n_perturbation_list)
+    results_root = os.path.join("results", result_folder_prefix)
+    if not args.force_rerun:
+        cached_run = find_completed_cached_run(results_root, safe_args, run_signature, expected_files)
+        if cached_run is not None:
+            print(f"Found completed cached run at: {os.path.abspath(cached_run)}")
+            print("Skipping rerun. Use --force_rerun to ignore cache.")
+            raise SystemExit(0)
+
     # define SAVE_FOLDER as the timestamp - base model name - mask filling model name
     # create it if it doesn't exist
     precision_string = "int8" if args.int8 else ("fp16" if args.half else "fp32")
-    sampling_string = "top_k" if args.do_top_k else ("top_p" if args.do_top_p else "temp")
-    output_subfolder = f"{args.output_name}/" if args.output_name else ""
-    if args.tinker_model is not None:
-        base_model_name = "tinker-" + sanitize_name(args.tinker_model)
-    elif args.openai_model is None:
-        base_model_name = sanitize_name(args.base_model_name)
-    else:
-        base_model_name = "openai-" + sanitize_name(args.openai_model)
-    scoring_model_string = sanitize_name(f"-{args.scoring_model_name}") if args.scoring_model_name else ""
-    mask_model_string = sanitize_name(args.mask_filling_model_name)
-    SAVE_FOLDER = f"tmp_results/{output_subfolder}{base_model_name}{scoring_model_string}-{mask_model_string}-{sampling_string}/{START_DATE}-{START_TIME}-{precision_string}-{args.pct_words_masked}-{args.n_perturbation_rounds}-{args.dataset}-{args.n_samples}"
+    SAVE_FOLDER = f"tmp_results/{result_folder_prefix}/{START_DATE}-{START_TIME}-{precision_string}-{args.pct_words_masked}-{args.n_perturbation_rounds}-{args.dataset}-{args.n_samples}"
     if not os.path.exists(SAVE_FOLDER):
         os.makedirs(SAVE_FOLDER)
     print(f"Saving results to absolute path: {os.path.abspath(SAVE_FOLDER)}")
 
     # write args to file
     with open(os.path.join(SAVE_FOLDER, "args.json"), "w") as f:
-        safe_args = dict(args.__dict__)
-        for secret_key in ['openai_key', 'tinker_api_key']:
-            if safe_args.get(secret_key):
-                safe_args[secret_key] = "***REDACTED***"
         json.dump(safe_args, f, indent=4)
+    with open(os.path.join(SAVE_FOLDER, "run_cache_meta.json"), "w") as f:
+        json.dump({"signature": run_signature, "completed": False}, f, indent=2)
 
     mask_filling_model_name = args.mask_filling_model_name
     n_samples = args.n_samples
     batch_size = args.batch_size
-    n_perturbation_list = [int(x) for x in args.n_perturbation_list.split(",")]
     n_perturbation_rounds = args.n_perturbation_rounds
     n_similarity_samples = args.n_similarity_samples
 
@@ -1161,14 +1331,21 @@ if __name__ == '__main__':
 
     tinker_backend = None
     if args.tinker_model is not None:
-        print(f'Loading Tinker sampling backend {args.tinker_model}...')
-        tinker_backend = model_backends.TinkerSamplingBackend(
-            args.tinker_model,
-            cache_dir=cache_dir,
-            tokenizer_name=args.tinker_tokenizer_name,
-            api_key=args.tinker_api_key,
-            cache_root=args.api_cache_dir,
-        )
+        backend_label = "Hugging Face" if resolved_model_backend == "hf" else "Tinker"
+        print(f'Loading {backend_label} sampling backend {args.tinker_model}...')
+        if resolved_model_backend == "hf":
+            tinker_backend = model_backends.TransformersBackend(
+                args.tinker_model,
+                quantization=args.hf_quantization,
+            )
+        else:
+            tinker_backend = model_backends.TinkerSamplingBackend(
+                args.tinker_model,
+                cache_dir=cache_dir,
+                tokenizer_name=args.tinker_tokenizer_name,
+                api_key=args.tinker_api_key,
+                cache_root=args.api_cache_dir,
+            )
 
     # generic generative model
     base_model, base_tokenizer = load_base_model_and_tokenizer(args.base_model_name)
@@ -1267,7 +1444,7 @@ if __name__ == '__main__':
 
     if not args.skip_baselines:
         baseline_outputs = [run_baseline_threshold_experiment(get_ll, "likelihood", n_samples=n_samples)]
-        if args.openai_model is None and args.tinker_model is None:
+        if using_local_transformers_backend():
             rank_criterion = lambda text: -get_rank(text, log=False)
             baseline_outputs.append(run_baseline_threshold_experiment(rank_criterion, "rank", n_samples=n_samples))
             logrank_criterion = lambda text: -get_rank(text, log=True)
@@ -1296,7 +1473,7 @@ if __name__ == '__main__':
         with open(os.path.join(SAVE_FOLDER, f"likelihood_threshold_results.json"), "w") as f:
             json.dump(baseline_outputs[0], f)
 
-        if args.openai_model is None and args.tinker_model is None:
+        if using_local_transformers_backend():
             # write rank threshold results to a file
             with open(os.path.join(SAVE_FOLDER, f"rank_threshold_results.json"), "w") as f:
                 json.dump(baseline_outputs[1], f)
@@ -1328,5 +1505,7 @@ if __name__ == '__main__':
     if not os.path.exists(os.path.dirname(new_folder)):
         os.makedirs(os.path.dirname(new_folder))
     os.rename(SAVE_FOLDER, new_folder)
+    with open(os.path.join(new_folder, "run_cache_meta.json"), "w") as f:
+        json.dump({"signature": run_signature, "completed": True}, f, indent=2)
 
     print(f"Used an *estimated* {API_TOKEN_COUNTER} API tokens (may be inaccurate)")

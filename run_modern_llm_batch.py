@@ -44,6 +44,12 @@ DATASET_MATRIX = [
         "source": "finance",
         "mask_model": "google/mt5-large",
     },
+    {
+        "dataset": "xsum",
+        "language": "en",
+        "source": "xsum",
+        "mask_model": "t5-large",
+    },
 ]
 
 
@@ -86,6 +92,8 @@ def build_jobs(args):
         DATASET_MATRIX,
         ["dataset_answers", "regenerated_answers"],
     ):
+        if args.datasets and dataset_cfg["dataset"] not in args.datasets:
+            continue
         if args.languages and dataset_cfg["language"] not in args.languages:
             continue
         if args.answer_modes and answer_mode not in args.answer_modes:
@@ -99,10 +107,12 @@ def build_jobs(args):
 
             model_name = pair[stage_name]
             manifest_path = None
-            if dataset_cfg["language"] == "en":
+            if dataset_cfg["dataset"] == "hc3":
                 manifest_path = args.dataset_manifest_en
-            elif dataset_cfg["language"] == "zh":
+            elif dataset_cfg["dataset"] == "hc3_zh":
                 manifest_path = args.dataset_manifest_zh
+            elif dataset_cfg["dataset"] == "xsum":
+                manifest_path = args.dataset_manifest_xsum
             config = {
                 "family": pair["family"],
                 "stage": stage_name,
@@ -153,6 +163,10 @@ def build_command(job, args):
         job["mask_model"],
         "--tinker_model",
         job["model_name"],
+        "--model_backend",
+        args.model_backend,
+        "--hf_quantization",
+        args.hf_quantization,
         "--base_model_name",
         job["model_name"],
         "--api_cache_dir",
@@ -196,14 +210,18 @@ def main():
     parser.add_argument("--dataset_split", type=str, default="train")
     parser.add_argument("--dataset_manifest_en", type=str, default=None)
     parser.add_argument("--dataset_manifest_zh", type=str, default=None)
+    parser.add_argument("--dataset_manifest_xsum", type=str, default=None)
     parser.add_argument("--api_cache_dir", type=str, default="api_cache")
     parser.add_argument("--cache_dir", type=str, default="~/.cache")
+    parser.add_argument("--model_backend", type=str, choices=["auto", "tinker", "hf"], default="auto")
+    parser.add_argument("--hf_quantization", type=str, choices=["none", "4bit", "8bit"], default="none")
     parser.add_argument("--min_sample_words", type=int, default=55)
     parser.add_argument("--regenerated_min_sample_words", type=int, default=30)
     parser.add_argument("--max_sample_tries", type=int, default=10)
     parser.add_argument("--output_prefix", type=str, default="modern_llm_batch")
     parser.add_argument("--marker_dir", type=str, default="batch_job_markers")
     parser.add_argument("--families", nargs="*", default=None)
+    parser.add_argument("--datasets", nargs="*", choices=["hc3", "hc3_zh", "xsum"], default=None)
     parser.add_argument("--languages", nargs="*", choices=["en", "zh"], default=None)
     parser.add_argument(
         "--stages",

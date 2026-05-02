@@ -7,6 +7,8 @@ from pathlib import Path
 
 import numpy as np
 import transformers
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
 
 def _stable_key(payload):
@@ -170,3 +172,132 @@ class TinkerSamplingBackend:
         if self.logprob_cache is not None:
             self.logprob_cache.set(cache_payload, {"mean_logprob": mean_logprob})
         return mean_logprob
+
+
+class TransformersBackend:
+    def __init__(self, model_name, quantization="none"):
+        print(f"[HF Backend] Loading {model_name}")
+
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        if self.tokenizer.pad_token_id is None:
+            self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.quantization = quantization
+
+        load_kwargs = {}
+        if quantization == "4bit":
+            load_kwargs["quantization_config"] = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_compute_dtype=torch.float16,
+            )
+            load_kwargs["device_map"] = "auto"
+        elif quantization == "8bit":
+            load_kwargs["quantization_config"] = BitsAndBytesConfig(
+                load_in_8bit=True,
+            )
+            load_kwargs["device_map"] = "auto"
+        elif self.device == "cuda":
+            load_kwargs["dtype"] = torch.float16
+
+        self.model = AutoModelForCausalLM.from_pretrained(model_name, **load_kwargs)
+        if quantization == "none":
+            self.model.to(self.device)
+        self.model.eval()
+
+    def _model_device(self):
+        try:
+            return next(self.model.parameters()).device
+        except StopIteration:
+            return torch.device(self.device)
+
+    def _to_device(self, inputs):
+        model_device = self._model_device()
+        return {k: v.to(model_device) for k, v in inputs.items()}
+
+    def sample(self, prompt, max_tokens=200, temperature=1.0, top_p=None, top_k=None, num_samples=1):
+        if hasattr(self.tokenizer, "chat_template") and self.tokenizer.chat_template is not None:
+            messages = [{"role": "user", "content": prompt}]
+            formatted = self.tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+        else:
+            formatted = prompt
+
+        inputs = self._to_device(
+            self.tokenizer(
+                formatted,
+                return_tensors="pt",
+                truncation=True,
+                max_length=512,
+            )
+        )
+        gen_kwargs = dict(
+            max_new_tokens=max_tokens,
+            min_new_tokens=50,
+            do_sample=True,
+            temperature=temperature,
+        )
+        if top_p is not None:
+            gen_kwargs["top_p"] = top_p
+        if top_k is not None:
+            gen_kwargs["top_k"] = top_k
+        with torch.no_grad():
+            outputs = self.model.generate(**inputs, **gen_kwargs)
+        input_len = inputs["input_ids"].shape[1]
+        return [
+            self.tokenizer.decode(outputs[i][input_len:], skip_special_tokens=True)
+            for i in range(outputs.shape[0])
+        ]
+
+    def get_mean_logprob(self, text):
+        inputs = self.tokenizer(
+            text,
+            return_tensors="pt",
+            truncation=True,
+            max_length=1024,
+        ).to(self._model_device())
+
+        with torch.no_grad():
+            outputs = self.model(**inputs, labels=inputs["input_ids"])
+            return -outputs.loss.item()
+
+    def get_mean_logprobs(self, texts, batch_size=8):
+        if not texts:
+            return []
+
+        results = []
+        model_device = self._model_device()
+        for start in range(0, len(texts), batch_size):
+            batch = texts[start:start + batch_size]
+            inputs = self.tokenizer(
+                batch,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=1024,
+            )
+            inputs = {k: v.to(model_device) for k, v in inputs.items()}
+
+            with torch.no_grad():
+                logits = self.model(
+                    input_ids=inputs["input_ids"],
+                    attention_mask=inputs.get("attention_mask"),
+                ).logits
+
+            shift_logits = logits[:, :-1, :]
+            shift_labels = inputs["input_ids"][:, 1:]
+            if "attention_mask" in inputs:
+                shift_mask = inputs["attention_mask"][:, 1:].float()
+            else:
+                shift_mask = torch.ones_like(shift_labels, dtype=torch.float32)
+
+            log_probs = torch.nn.functional.log_softmax(shift_logits, dim=-1)
+            token_log_probs = log_probs.gather(dim=-1, index=shift_labels.unsqueeze(-1)).squeeze(-1)
+            token_log_probs = token_log_probs * shift_mask
+            lengths = shift_mask.sum(dim=-1).clamp_min(1.0)
+            batch_means = token_log_probs.sum(dim=-1) / lengths
+            results.extend(batch_means.detach().cpu().tolist())
+
+        return [float(x) for x in results]
